@@ -265,21 +265,75 @@ class SessionPage(tk.Frame):
                 "trials": self.trial_count
             }
             
-            # Move to next session or finish
+            # Move to next session
             self.controller.current_session += 1
             self.sr_timer_running = False
             self.eo_timer_running = False
             self.sr_time = 0
             self.eo_time = 0
-            self.update_frame()
+            
             # End of all sessions
             if self.controller.current_session < len(self.controller.session_types):
-                self.update_frame()
+                # Create custom popup for session confirmation
+                self.show_begin_session_popup()
             else:
                 # End of all sessions
                 self.controller.stop_data_collection()
                 messagebox.showinfo("Complete", "All sessions completed. Data has been saved.")
                 self.controller.destroy()
+    
+    def show_begin_session_popup(self):
+        """Show a popup that allows the user to begin the next session"""
+        session_type = self.controller.session_types[self.controller.current_session]
+        
+        # Create a custom dialog
+        popup = tk.Toplevel(self)
+        popup.title("Begin Next Session")
+        popup.geometry("400x200")
+        popup.transient(self)  # Set to be on top of the main window
+        popup.grab_set()  # Modal dialog
+        
+        # Add padding around all widgets
+        frame = ttk.Frame(popup, padding=20)
+        frame.pack(fill="both", expand=True)
+        
+        # Title and session info
+        ttk.Label(
+            frame, 
+            text=f"Session {self.controller.current_session + 1} of {len(self.controller.session_types)}",
+            font=("Helvetica", 14, "bold")
+        ).pack(pady=(0, 10))
+        
+        ttk.Label(
+            frame, 
+            text=f"Type: {session_type}",
+            font=("Helvetica", 12)
+        ).pack(pady=(0, 20))
+        
+        # Begin button
+        begin_button = ttk.Button(
+            frame, 
+            text="Begin Session", 
+            command=lambda: self.begin_next_session(popup),
+            padding=10
+        )
+        begin_button.pack(pady=10)
+        
+        # Center the popup on the screen
+        popup.update_idletasks()
+        width = popup.winfo_width()
+        height = popup.winfo_height()
+        x = (popup.winfo_screenwidth() // 2) - (width // 2)
+        y = (popup.winfo_screenheight() // 2) - (height // 2)
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+    
+    def begin_next_session(self, popup):
+        """Begin the next session after confirmation"""
+        # Close the popup
+        popup.destroy()
+        
+        # Update the session frame
+        self.update_frame()
     
     def update_frame(self):
         # Update session information
