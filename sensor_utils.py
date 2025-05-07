@@ -113,21 +113,24 @@ def collect_sensor_data(sensors, data_queue, running, paused):
                         # Clear the buffer after processing
                         sensor_info["device"].data_buffer = []
                 elif "Audio" in sensor_id and "processor" in sensor_info:
-                    # For real audio sensor, get features from the processor
-                    audio_features = sensor_info["processor"].get_audio_features()
-                    if audio_features is not None:
-                        # Process audio features for ML prediction
-                        prediction = process_audio_data(audio_features)
-                        if prediction is not None:
-                            # Format data as [amplitude, frequency] for consistency with simulated data
-                            data = [prediction, audio_features['zero_crossing_rate']]
-                            
-                            # Put data in queue for processing
-                            data_queue.put({
-                                "sensor_id": sensor_id,
-                                "timestamp": audio_features['timestamp'],
-                                "data": data
-                            })
+                    try:
+                        # For real audio sensor, get features from the processor
+                        audio_features = sensor_info["processor"].get_audio_features()
+                        if audio_features is not None:
+                            # Process audio features for ML prediction
+                            prediction = process_audio_data(audio_features)
+                            if prediction is not None:
+                                # Format data as [amplitude, frequency] for consistency with simulated data
+                                data = [prediction, audio_features['zero_crossing_rate']]
+                                
+                                # Put data in queue for processing
+                                data_queue.put({
+                                    "sensor_id": sensor_id,
+                                    "timestamp": audio_features['timestamp'],
+                                    "data": data
+                                })
+                    except Exception as e:
+                        print(f"Error processing audio data: {str(e)}")
 
 def process_sensor_data(data_item, data_dir, current_session, session_types):
     """Process and save sensor data"""
@@ -153,28 +156,26 @@ def process_sensor_data(data_item, data_dir, current_session, session_types):
         session_type = session_types[current_session]
         filename = os.path.join(data_dir, f"session_{current_session}_{session_type}_{sensor_id}.csv")
         
-        # Append data to file
-        with open(filename, "a") as f:
-            if os.path.getsize(filename) == 0:
-                # Write header if file is empty
-                if "BLE_IMU" in sensor_id:
-                    f.write("timestamp,qw,qx,qy,qz,roll,pitch,yaw\n")
-                elif "TCP" in sensor_id:
-                    f.write("timestamp,value1,value2,value3\n")
-                elif "Audio" in sensor_id:
-                    f.write("timestamp,amplitude,frequency\n")
-            
-            # Format all numeric values to 2 decimal places
-            formatted_data = [f"{x:.3f}" for x in data]
-            formatted_timestamp = f"{timestamp:.3f}"
-            
-            # Write data
-            if "BLE_IMU" in sensor_id:
+        try:
+            # Append data to file
+            with open(filename, "a") as f:
+                if os.path.getsize(filename) == 0:
+                    # Write header if file is empty
+                    if "BLE_IMU" in sensor_id:
+                        f.write("timestamp,qw,qx,qy,qz,roll,pitch,yaw\n")
+                    elif "TCP" in sensor_id:
+                        f.write("timestamp,value1,value2,value3\n")
+                    elif "Audio" in sensor_id:
+                        f.write("timestamp,amplitude,frequency\n")
+                
+                # Format all numeric values to 2 decimal places
+                formatted_data = [f"{x:.3f}" for x in data]
+                formatted_timestamp = f"{timestamp:.3f}"
+                
+                # Write data
                 f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
-            elif "TCP" in sensor_id:
-                f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
-            elif "Audio" in sensor_id:
-                f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
+        except Exception as e:
+            print(f"Error saving sensor data: {str(e)}")
 
 def get_recent_sensor_data(seconds=5):
     """

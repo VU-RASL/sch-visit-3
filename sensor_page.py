@@ -4,6 +4,8 @@ import asyncio
 import threading
 import sensor_utils
 from audio_utils import AudioProcessor
+import os
+import datetime
 
 class SensorPage(tk.Frame):
     def __init__(self, parent, controller):
@@ -13,6 +15,23 @@ class SensorPage(tk.Frame):
         
         # Create widgets
         self.create_widgets()
+        
+        # Bind cleanup to window close event
+        self.bind_all("<Destroy>", self._on_destroy)
+    
+    def _on_destroy(self, event):
+        """Handle window destruction"""
+        if event.widget == self:
+            self.cleanup_audio()
+    
+    def cleanup_audio(self):
+        """Clean up audio resources"""
+        if self.audio_processor is not None:
+            try:
+                self.audio_processor.cleanup()
+            except Exception as e:
+                print(f"Error cleaning up audio processor: {str(e)}")
+            self.audio_processor = None
     
     def create_widgets(self):
         # Title with improved styling
@@ -120,33 +139,6 @@ class SensorPage(tk.Frame):
             self.setup_simulated_ble()
             self.setup_other_sensors()
             self.finish_connection()
-        
-        # Audio Sensor
-        if self.audio_var.get() == "simulate":
-            self.controller.sensors["Audio_1"] = {
-                "type": "simulated",
-                "connected": True
-            }
-            self.status_indicators["Audio_1"].config(bg="green")
-        else:
-            try:
-                # Initialize real audio processor
-                self.audio_processor = AudioProcessor()
-                self.audio_processor.start_recording()
-                
-                self.controller.sensors["Audio_1"] = {
-                    "type": "real",
-                    "connected": True,
-                    "processor": self.audio_processor
-                }
-                self.status_indicators["Audio_1"].config(bg="green")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to initialize audio sensor: {str(e)}")
-                self.controller.sensors["Audio_1"] = {
-                    "type": "simulated",
-                    "connected": True
-                }
-                self.status_indicators["Audio_1"].config(bg="green")
     
     def connect_ble_sensors(self, progress_window):
         try:
@@ -264,16 +256,41 @@ class SensorPage(tk.Frame):
             }
             self.status_indicators["Audio_1"].config(bg="green")
         else:
-            # Connect to real audio sensor (not implemented yet)
-            self.controller.sensors["Audio_1"] = {
-                "type": "simulated",  # Change to "real" when implemented
-                "connected": True
-            }
-            self.status_indicators["Audio_1"].config(bg="green")
+            try:
+                # Clean up any existing audio processor
+                self.cleanup_audio()
+                
+                # Initialize real audio processor
+                self.audio_processor = AudioProcessor()
+                
+                # Store the processor in the sensor info, but don't start recording yet
+                self.controller.sensors["Audio_1"] = {
+                    "type": "real",
+                    "connected": True,
+                    "processor": self.audio_processor
+                }
+                self.status_indicators["Audio_1"].config(bg="green")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to initialize audio sensor: {str(e)}")
+                self.controller.sensors["Audio_1"] = {
+                    "type": "simulated",
+                    "connected": True
+                }
+                self.status_indicators["Audio_1"].config(bg="green")
     
     def finish_connection(self):
-        # Start data collection
+        # Start data collection (this will create the data directory)
         self.controller.start_data_collection()
+        
+        # Now that data directory is created, start audio recording if using real audio
+        if self.audio_var.get() == "real" and "Audio_1" in self.controller.sensors:
+            audio_sensor = self.controller.sensors["Audio_1"]
+            if audio_sensor["type"] == "real" and "processor" in audio_sensor:
+                try:
+                    # Start recording in the controller's data directory
+                    audio_sensor["processor"].start_recording(output_dir=self.controller.data_dir)
+                except Exception as e:
+                    print(f"Error starting audio recording: {str(e)}")
         
         # Show success message
         messagebox.showinfo("Connected", "All sensors connected successfully!")
@@ -284,13 +301,11 @@ class SensorPage(tk.Frame):
         
         # Reset button state
         self.connect_button.config(state="normal", text="Connect & Start")
-        
-        # Clean up audio processor if it exists
-        if self.audio_processor is not None:
-            self.audio_processor.cleanup()
-            self.audio_processor = None
     
     def update_frame(self):
         # Reset status indicators when the frame is shown
         for canvas in self.status_indicators.values():
             canvas.config(bg="gray")
+        
+        # Clean up audio processor
+        self.cleanup_audio()
