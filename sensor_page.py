@@ -3,11 +3,13 @@ from tkinter import ttk, messagebox, scrolledtext
 import asyncio
 import threading
 import sensor_utils
+from audio_utils import AudioProcessor
 
 class SensorPage(tk.Frame):
     def __init__(self, parent, controller):
         super().__init__(parent)
         self.controller = controller
+        self.audio_processor = None
         
         # Create widgets
         self.create_widgets()
@@ -118,6 +120,33 @@ class SensorPage(tk.Frame):
             self.setup_simulated_ble()
             self.setup_other_sensors()
             self.finish_connection()
+        
+        # Audio Sensor
+        if self.audio_var.get() == "simulate":
+            self.controller.sensors["Audio_1"] = {
+                "type": "simulated",
+                "connected": True
+            }
+            self.status_indicators["Audio_1"].config(bg="green")
+        else:
+            try:
+                # Initialize real audio processor
+                self.audio_processor = AudioProcessor()
+                self.audio_processor.start_recording()
+                
+                self.controller.sensors["Audio_1"] = {
+                    "type": "real",
+                    "connected": True,
+                    "processor": self.audio_processor
+                }
+                self.status_indicators["Audio_1"].config(bg="green")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to initialize audio sensor: {str(e)}")
+                self.controller.sensors["Audio_1"] = {
+                    "type": "simulated",
+                    "connected": True
+                }
+                self.status_indicators["Audio_1"].config(bg="green")
     
     def connect_ble_sensors(self, progress_window):
         try:
@@ -158,7 +187,8 @@ class SensorPage(tk.Frame):
                     self.controller.sensors[sensor_id] = {
                         "type": "real",
                         "connected": True,
-                        "device": device  # Store the device object for later use
+                        "device": device,  # Store the device object for later use
+                        "loop": loop  # Store the event loop for this device
                     }
                     
                     # Update status indicator in the main thread
@@ -176,6 +206,15 @@ class SensorPage(tk.Frame):
             
             # Setup other sensors
             self.after(0, self.setup_other_sensors)
+            
+            # Start a thread to keep the event loop running
+            def run_event_loop():
+                try:
+                    loop.run_forever()
+                except Exception as e:
+                    print(f"Event loop error: {str(e)}")
+            
+            threading.Thread(target=run_event_loop, daemon=True).start()
             
             # Close the progress window and finish connection in the main thread
             self.after(0, progress_window.destroy)
@@ -245,6 +284,11 @@ class SensorPage(tk.Frame):
         
         # Reset button state
         self.connect_button.config(state="normal", text="Connect & Start")
+        
+        # Clean up audio processor if it exists
+        if self.audio_processor is not None:
+            self.audio_processor.cleanup()
+            self.audio_processor = None
     
     def update_frame(self):
         # Reset status indicators when the frame is shown

@@ -5,6 +5,9 @@ import random
 import time
 from PIL import Image, ImageTk
 import os
+import requests
+import json
+from datetime import datetime
 
 class SessionPage(tk.Frame):
     def __init__(self, parent, controller):
@@ -417,6 +420,29 @@ class SessionPage(tk.Frame):
     def show_notification(self, message):
         """Show a notification to the participant"""
         messagebox.showinfo("Notification", message)
+        
+        # Update Firebase database
+        try:
+            # Format data to send to Firebase
+            data = {
+                'notification_type': message,
+                'timestamp': datetime.now().isoformat(),
+                'session_type': self.controller.session_types[self.controller.current_session] if self.controller.current_session < len(self.controller.session_types) else "Unknown",
+                'current_state': self.current_state
+            }
+            
+            # Firebase database URL
+            firebase_url = "https://visit3-8c2c0-default-rtdb.europe-west1.firebasedatabase.app/notifications.json"
+            
+            # Send POST request to Firebase (creates a new entry with an auto-generated ID)
+            response = requests.post(firebase_url, data=json.dumps(data))
+            
+            if response.status_code == 200:
+                print(f"Notification sent to Firebase: {message}")
+            else:
+                print(f"Failed to send notification to Firebase. Status code: {response.status_code}")
+        except Exception as e:
+            print(f"Error updating Firebase database: {str(e)}")
 
     def start_eo_timer(self):
         """Start the EO timer"""

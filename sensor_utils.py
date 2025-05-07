@@ -9,6 +9,7 @@ import queue
 import asyncio
 import struct
 from scipy.spatial.transform import Rotation
+from audio_utils import process_audio_data
 
 # Data buffer to store recent sensor data
 sensor_data_buffer = {}
@@ -86,26 +87,47 @@ def collect_sensor_data(sensors, data_queue, running, paused):
                         "timestamp": current_time,
                         "data": data
                     })
-            elif sensor_info["type"] == "real" and "BLE_IMU" in sensor_id:
-                # For real BLE sensors, get the latest data from the device
-                if "device" in sensor_info and hasattr(sensor_info["device"], "data_buffer") and sensor_info["device"].data_buffer:
-                    # Get the latest data point
-                    latest_data = sensor_info["device"].data_buffer[-1] if sensor_info["device"].data_buffer else None
-                    
-                    if latest_data is not None:
-                        # Extract quaternion and Euler angles
-                        # Format: [timestamp, battery, cal, qw, qx, qy, qz, roll, pitch, yaw]
-                        qw, qx, qy, qz = latest_data[3:7]
-                        roll, pitch, yaw = latest_data[7:10]
+            elif sensor_info["type"] == "real":
+                if "BLE_IMU" in sensor_id:
+                    # For real BLE sensors, get all data from the device buffer
+                    if "device" in sensor_info and hasattr(sensor_info["device"], "data_buffer") and sensor_info["device"].data_buffer:
+                        # Process all samples in the buffer
+                        for sample in sensor_info["device"].data_buffer:
+                            if sample is not None:
+                                # Extract quaternion and Euler angles
+                                # Format: [timestamp, battery, cal, qw, qx, qy, qz, roll, pitch, yaw]
+                                qw, qx, qy, qz = sample[3:7]
+                                roll, pitch, yaw = sample[7:10]
+                                
+                                # Ensure data is in the correct format: [qw, qx, qy, qz, roll, pitch, yaw]
+                                data = [float(qw), float(qx), float(qy), float(qz), 
+                                      float(roll), float(pitch), float(yaw)]
+                                
+                                # Put data in queue for processing with the sample's timestamp
+                                data_queue.put({
+                                    "sensor_id": sensor_id,
+                                    "timestamp": float(sample[0]),  # Ensure timestamp is float
+                                    "data": data
+                                })
                         
-                        data = [qw, qx, qy, qz, roll, pitch, yaw]
-                        
-                        # Put data in queue for processing
-                        data_queue.put({
-                            "sensor_id": sensor_id,
-                            "timestamp": latest_data[0],  # Use the timestamp from the device
-                            "data": data
-                        })
+                        # Clear the buffer after processing
+                        sensor_info["device"].data_buffer = []
+                elif "Audio" in sensor_id and "processor" in sensor_info:
+                    # For real audio sensor, get features from the processor
+                    audio_features = sensor_info["processor"].get_audio_features()
+                    if audio_features is not None:
+                        # Process audio features for ML prediction
+                        prediction = process_audio_data(audio_features)
+                        if prediction is not None:
+                            # Format data as [amplitude, frequency] for consistency with simulated data
+                            data = [prediction, audio_features['zero_crossing_rate']]
+                            
+                            # Put data in queue for processing
+                            data_queue.put({
+                                "sensor_id": sensor_id,
+                                "timestamp": audio_features['timestamp'],
+                                "data": data
+                            })
 
 def process_sensor_data(data_item, data_dir, current_session, session_types):
     """Process and save sensor data"""
@@ -142,13 +164,17 @@ def process_sensor_data(data_item, data_dir, current_session, session_types):
                 elif "Audio" in sensor_id:
                     f.write("timestamp,amplitude,frequency\n")
             
+            # Format all numeric values to 2 decimal places
+            formatted_data = [f"{x:.3f}" for x in data]
+            formatted_timestamp = f"{timestamp:.3f}"
+            
             # Write data
             if "BLE_IMU" in sensor_id:
-                f.write(f"{timestamp},{','.join(map(str, data))}\n")
+                f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
             elif "TCP" in sensor_id:
-                f.write(f"{timestamp},{','.join(map(str, data))}\n")
+                f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
             elif "Audio" in sensor_id:
-                f.write(f"{timestamp},{','.join(map(str, data))}\n")
+                f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
 
 def get_recent_sensor_data(seconds=5):
     """
@@ -278,15 +304,19 @@ class BLEDevice:
     
     async def notification_handler(self, sender, data):
         """Handle incoming notifications from this device"""
-        # Store raw data
-        self.raw_buffer.append(data)
-        
-        # Process data
-        processed_data = self.process_data(data, freq, use_lin_accel=False)
-        
-        # Append processed data
-        for sample in processed_data:
-            self.data_buffer.append(sample)
+        try:
+            # Store raw data
+            self.raw_buffer.append(data)
+            
+            # Process data
+            processed_data = self.process_data(data, freq)
+            
+            # Append processed data
+            for sample in processed_data:
+                self.data_buffer.append(sample)
+                # print(f"Added sample to buffer: {sample[0]:.3f}")  # Print timestamp of added sample
+        except Exception as e:
+            print(f"Error in notification handler: {str(e)}")
     
     async def connect(self):
         """Connect to this BLE device"""
@@ -370,19 +400,17 @@ class BLEDevice:
         
         return int_part + frac_part
     
-    def process_data(self, raw_data, freq, use_lin_accel=False):
+    def process_data(self, raw_data, freq):
         """Process raw BLE data into readable form"""
         
-        if use_lin_accel:
-            num_samples = 12
-            out = np.zeros((num_samples, 13))
-        else:
-            num_samples = 21
-            out = np.zeros((num_samples, 10))
+        num_samples = 12
+        out = np.zeros((num_samples, 10))
         
         # Extract time data - make sure indexing matches MATLAB
         # Using 7 bytes for timestamp as specified
         t = self.clock_out(raw_data[2:9])
+        print(f"Processing data at time {t}")
+        print(f"Length of raw data: {len(raw_data)}")
         
         # Battery and calibration - note the indexing
         # Using 2 bytes for each value to match MATLAB
@@ -395,19 +423,29 @@ class BLEDevice:
 
         # Process each sample
         for i in range(num_samples):
-            out[i, 0] = t + (i - 21) * (1/freq)
+            # Calculate timestamp for this sample
+            out[i, 0] = t + (i - 11) * (1 / freq)
+            print(f"Timestamp for sample {i}: {out[i, 0]:.3f}")
             
-            # Quaternions - using 2 bytes for each value
-            qw = self.bytes_to_double(raw_data[8+i*2:10+i*2])
-            qx = self.bytes_to_double(raw_data[32+i*2:34+i*2])
-            qy = self.bytes_to_double(raw_data[56+i*2:58+i*2])
-            qz = self.bytes_to_double(raw_data[80+i*2:82+i*2])
+            # Extract quaternions - using 2 bytes for each value
+            qw = self.bytes_to_double(raw_data[10 + i*2 : 12 + i*2])
+            qx = self.bytes_to_double(raw_data[52 + i*2 : 54 + i*2])
+            qy = self.bytes_to_double(raw_data[94 + i*2 : 96 + i*2])
+            qz = self.bytes_to_double(raw_data[136 + i*2 : 138 + i*2])
+            
+            # Normalize quaternion
+            # norm = math.sqrt(qw**2 + qx**2 + qy**2 + qz**2)
+            # if norm > 0:  # Avoid division by zero
+            #     qw, qx, qy, qz = qw/norm, qx/norm, qy/norm, qz/norm
             
             out[i, 3:7] = [qw, qx, qy, qz]
             
-            # Try first without normalization to match MATLAB
+            # Calculate Euler angles from normalized quaternion
             rot = Rotation.from_quat([qx, qy, qz, qw])
             eul = rot.as_euler('xyz', degrees=False)
             out[i, 7:10] = eul
+            
+            if i == 0:  # Print first sample for debugging
+                print(f"Sample {i} - Quaternion: [{qw:.3f}, {qx:.3f}, {qy:.3f}, {qz:.3f}], Euler: [{eul[0]:.3f}, {eul[1]:.3f}, {eul[2]:.3f}]")
         
         return out
