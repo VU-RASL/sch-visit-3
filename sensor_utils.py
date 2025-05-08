@@ -117,12 +117,9 @@ def collect_sensor_data(sensors, data_queue, running, paused):
                         # For real audio sensor, get features from the processor
                         audio_features = sensor_info["processor"].get_audio_features()
                         if audio_features is not None:
-                            # Process audio features for ML prediction
-                            prediction = process_audio_data(audio_features)
-                            if prediction is not None:
-                                # Format data as [amplitude, frequency] for consistency with simulated data
-                                data = [prediction, audio_features['zero_crossing_rate']]
-                                
+                            # Process audio features to match simulated data format [amplitude, frequency]
+                            data = process_audio_data(audio_features)
+                            if data is not None:
                                 # Put data in queue for processing
                                 data_queue.put({
                                     "sensor_id": sensor_id,
@@ -154,7 +151,16 @@ def process_sensor_data(data_item, data_dir, current_session, session_types):
     # Save data to file
     if current_session < len(session_types):
         session_type = session_types[current_session]
-        filename = os.path.join(data_dir, f"session_{current_session}_{session_type}_{sensor_id}.csv")
+        
+        # Get device name for BLE sensors
+        device_name = ""
+        if "BLE_IMU" in sensor_id:
+            for device in ble_devices:
+                if device.idx == int(sensor_id.split("_")[-1]) - 1:  # Subtract 1 to convert from 1-based to 0-based indexing
+                    device_name = f"_{device.name}"
+                    break
+        
+        filename = os.path.join(data_dir, f"session_{current_session}_{session_type}_{sensor_id}{device_name}.csv")
         
         try:
             # Append data to file
@@ -238,8 +244,11 @@ def run_ml_prediction(participant_data):
     tcp_sample_count = 0
     audio_sample_count = 0
     
-    # Count IMU sensor samples
+    # Count IMU sensor samples per device
+    imu_samples_by_device = {}
     for sensor_id, sensor_data in recent_data["imu_sensors"].items():
+        device_name = f"BLE_IMU_{sensor_id.split('_')[-1]}"
+        imu_samples_by_device[device_name] = len(sensor_data["data"])
         imu_sample_count += len(sensor_data["data"])
     
     # Count TCP sensor samples
@@ -253,12 +262,20 @@ def run_ml_prediction(participant_data):
     # Store sample counts in a dictionary
     sample_counts = {
         "imu_samples": imu_sample_count,
+        "imu_samples_by_device": imu_samples_by_device,
         "tcp_samples": tcp_sample_count,
         "audio_samples": audio_sample_count,
         "total_samples": imu_sample_count + tcp_sample_count + audio_sample_count
     }
 
-    print(sample_counts)
+    print("Sample counts:")
+    print(f"Total IMU samples: {imu_sample_count}")
+    print("IMU samples by device:")
+    for device, count in imu_samples_by_device.items():
+        print(f"  {device}: {count} samples")
+    print(f"TCP samples: {tcp_sample_count}")
+    print(f"Audio samples: {audio_sample_count}")
+    print(f"Total samples: {sample_counts['total_samples']}")
     
     # For now, just generate a random prediction as placeholder
     threshold = float(participant_data.get("ml_threshold", 0.5))
@@ -404,14 +421,12 @@ class BLEDevice:
     def process_data(self, raw_data, freq):
         """Process raw BLE data into readable form"""
         
-        num_samples = 12
+        num_samples = 21
         out = np.zeros((num_samples, 10))
         
         # Extract time data - make sure indexing matches MATLAB
         # Using 7 bytes for timestamp as specified
         t = self.clock_out(raw_data[2:9])
-        print(f"Processing data at time {t}")
-        print(f"Length of raw data: {len(raw_data)}")
         
         # Battery and calibration - note the indexing
         # Using 2 bytes for each value to match MATLAB
@@ -426,27 +441,18 @@ class BLEDevice:
         for i in range(num_samples):
             # Calculate timestamp for this sample
             out[i, 0] = t + (i - 11) * (1 / freq)
-            print(f"Timestamp for sample {i}: {out[i, 0]:.3f}")
             
             # Extract quaternions - using 2 bytes for each value
-            qw = self.bytes_to_double(raw_data[10 + i*2 : 12 + i*2])
-            qx = self.bytes_to_double(raw_data[52 + i*2 : 54 + i*2])
-            qy = self.bytes_to_double(raw_data[94 + i*2 : 96 + i*2])
-            qz = self.bytes_to_double(raw_data[136 + i*2 : 138 + i*2])
-            
-            # Normalize quaternion
-            # norm = math.sqrt(qw**2 + qx**2 + qy**2 + qz**2)
-            # if norm > 0:  # Avoid division by zero
-            #     qw, qx, qy, qz = qw/norm, qx/norm, qy/norm, qz/norm
+            qw = self.bytes_to_double(raw_data[10 + i*2 : 12 + i*2]) / 2**14
+            qx = self.bytes_to_double(raw_data[52 + i*2 : 54 + i*2]) / 2**14
+            qy = self.bytes_to_double(raw_data[94 + i*2 : 96 + i*2]) / 2**14
+            qz = self.bytes_to_double(raw_data[136 + i*2 : 138 + i*2]) / 2**14
             
             out[i, 3:7] = [qw, qx, qy, qz]
             
             # Calculate Euler angles from normalized quaternion
             rot = Rotation.from_quat([qx, qy, qz, qw])
-            eul = rot.as_euler('xyz', degrees=False)
+            eul = rot.as_euler('xyz', degrees=True)
             out[i, 7:10] = eul
             
-            if i == 0:  # Print first sample for debugging
-                print(f"Sample {i} - Quaternion: [{qw:.3f}, {qx:.3f}, {qy:.3f}, {qz:.3f}], Euler: [{eul[0]:.3f}, {eul[1]:.3f}, {eul[2]:.3f}]")
-        
         return out

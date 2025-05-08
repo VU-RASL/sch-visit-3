@@ -223,20 +223,27 @@ def process_audio_data(audio_features):
     if audio_features is None:
         return None
         
-    try:
-        # Extract relevant features
-        rms_energy = audio_features['rms_energy']
-        zcr = audio_features['zero_crossing_rate']
-        
-        # Normalize features
-        rms_norm = np.clip(rms_energy / 0.5, 0, 1)  # Assuming max RMS of 0.5
-        zcr_norm = np.clip(zcr / 0.1, 0, 1)  # Assuming max ZCR of 0.1
-        
-        # Combine features (simple weighted average)
-        prediction = 0.7 * rms_norm + 0.3 * zcr_norm
-        
-        return prediction
-        
-    except Exception as e:
-        print(f"Error processing audio data: {str(e)}")
-        return None 
+    # Extract features
+    mel_spec = audio_features['mel_spectrogram']
+    rms = audio_features['rms_energy']
+    zcr = audio_features['zero_crossing_rate']
+    
+    # Calculate average values
+    avg_mel = np.mean(mel_spec, axis=1)
+    avg_rms = np.mean(rms)
+    
+    # Find dominant frequency using mel spectrogram
+    # The mel spectrogram is already in dB scale
+    # Find the mel bin with maximum energy
+    dominant_mel_bin = np.argmax(np.mean(mel_spec, axis=1))
+    
+    # Convert mel bin to approximate frequency (Hz)
+    # Using librosa's mel_frequencies to get the frequency for this mel bin
+    mel_freqs = librosa.mel_frequencies(n_mels=40, fmin=0, fmax=8000)
+    dominant_freq = mel_freqs[dominant_mel_bin]
+    
+    # Normalize RMS to match simulated amplitude range (0-1)
+    normalized_rms = np.clip(avg_rms / 0.5, 0, 1)  # Assuming max RMS of 0.5
+    
+    # Return data in same format as simulated audio: [amplitude, frequency]
+    return [float(normalized_rms), float(dominant_freq)] 
