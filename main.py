@@ -150,16 +150,16 @@ class IISCAApp(tk.Tk):
                 # Run ML prediction every 5 seconds for non-Standard sessions
                 current_time = time.time()
                 if (current_time - last_ml_run_time >= 5.0 and
-                    hasattr(self.frames[SessionPage], "ml_prediction_active") and
-                    self.frames[SessionPage].ml_prediction_active and
-                    self.current_session < len(self.session_types) and
-                    self.session_types[self.current_session] != "Standard"):
+                    self.current_session < len(self.session_types)):
                     
                     # Generate prediction and get sample counts using the sensor_utils module
                     prediction_value, sample_counts = sensor_utils.run_ml_prediction(self.participant_data)
                     
-                    # Update the ML prediction display in the session page
-                    self.frames[SessionPage].update_ml_display(prediction_value, sample_counts)
+                    if (hasattr(self.frames[SessionPage], "ml_prediction_active") and
+                    self.frames[SessionPage].ml_prediction_active and
+                    self.session_types[self.current_session] != "Standard"):
+                        # Update the ML prediction display in the session page
+                        self.frames[SessionPage].update_ml_display(prediction_value, sample_counts)
                     
                     # Update the last run time
                     last_ml_run_time = current_time

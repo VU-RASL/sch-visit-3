@@ -148,40 +148,37 @@ def process_sensor_data(data_item, data_dir, current_session, session_types):
         if current_time - ts <= buffer_max_age
     ]
     
-    # Save data to file
-    if current_session < len(session_types):
-        session_type = session_types[current_session]
-        
-        # Get device name for BLE sensors
-        device_name = ""
-        if "BLE_IMU" in sensor_id:
-            for device in ble_devices:
-                if device.idx == int(sensor_id.split("_")[-1]) - 1:  # Subtract 1 to convert from 1-based to 0-based indexing
-                    device_name = f"_{device.name}"
-                    break
-        
-        filename = os.path.join(data_dir, f"session_{current_session}_{session_type}_{sensor_id}{device_name}.csv")
-        
-        try:
-            # Append data to file
-            with open(filename, "a") as f:
-                if os.path.getsize(filename) == 0:
-                    # Write header if file is empty
-                    if "BLE_IMU" in sensor_id:
-                        f.write("timestamp,qw,qx,qy,qz,roll,pitch,yaw\n")
-                    elif "TCP" in sensor_id:
-                        f.write("timestamp,value1,value2,value3\n")
-                    elif "Audio" in sensor_id:
-                        f.write("timestamp,amplitude,frequency\n")
-                
-                # Format all numeric values to 2 decimal places
-                formatted_data = [f"{x:.3f}" for x in data]
-                formatted_timestamp = f"{timestamp:.3f}"
-                
-                # Write data
-                f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
-        except Exception as e:
-            print(f"Error saving sensor data: {str(e)}")
+    # Get device name for BLE sensors
+    device_name = ""
+    if "BLE_IMU" in sensor_id:
+        for device in ble_devices:
+            if device.idx == int(sensor_id.split("_")[-1]) - 1:  # Subtract 1 to convert from 1-based to 0-based indexing
+                device_name = f"_{device.name}"
+                break
+    
+    # Create filename based on sensor type only
+    filename = os.path.join(data_dir, f"{sensor_id}{device_name}.csv")
+    
+    try:
+        # Append data to file
+        with open(filename, "a") as f:
+            if os.path.getsize(filename) == 0:
+                # Write header if file is empty
+                if "BLE_IMU" in sensor_id:
+                    f.write("timestamp,qw,qx,qy,qz,roll,pitch,yaw\n")
+                elif "TCP" in sensor_id:
+                    f.write("timestamp,value1,value2,value3\n")
+                elif "Audio" in sensor_id:
+                    f.write("timestamp,amplitude,frequency\n")
+            
+            # Format all numeric values to 2 decimal places
+            formatted_data = [f"{x:.3f}" for x in data]
+            formatted_timestamp = f"{timestamp:.3f}"
+            
+            # Write data
+            f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
+    except Exception as e:
+        print(f"Error saving sensor data: {str(e)}")
 
 def get_recent_sensor_data(seconds=5):
     """
@@ -234,11 +231,11 @@ def get_recent_sensor_data(seconds=5):
     
     return recent_data
 
-def run_ml_prediction(participant_data):
-    """Run machine learning prediction on sensor data"""
-    # Get the last 5 seconds of sensor data
+def get_samples():
+    """Get the last N seconds of sensor data for all sensors"""
+    # Get recent sensor data
     recent_data = get_recent_sensor_data(seconds=5)
-    
+
     # Count samples for each sensor type
     imu_sample_count = 0
     tcp_sample_count = 0
@@ -276,6 +273,13 @@ def run_ml_prediction(participant_data):
     print(f"TCP samples: {tcp_sample_count}")
     print(f"Audio samples: {audio_sample_count}")
     print(f"Total samples: {sample_counts['total_samples']}")
+
+    return recent_data, sample_counts
+
+def run_ml_prediction(participant_data):
+    """Run machine learning prediction on sensor data"""
+    # Get the last 5 seconds of sensor data
+    recent_data, sample_counts = get_samples()
     
     # For now, just generate a random prediction as placeholder
     threshold = float(participant_data.get("ml_threshold", 0.5))

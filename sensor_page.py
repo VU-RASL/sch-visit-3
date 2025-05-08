@@ -293,7 +293,7 @@ class SensorPage(tk.Frame):
                     print(f"Error starting audio recording: {str(e)}")
         
         # Show success message
-        messagebox.showinfo("Connected", "All sensors connected successfully!")
+        print("All sensors connected successfully!")
         
         # Move to session page
         self.controller.current_session = 0

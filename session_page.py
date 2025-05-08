@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext
 import queue
 import random
 import time
@@ -8,6 +8,45 @@ import os
 import requests
 import json
 from datetime import datetime
+
+class NonBlockingPopup(tk.Toplevel):
+    def __init__(self, parent, title, message, auto_dismiss_ms=3000):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("300x150")
+        self.transient(parent)
+        
+        # Add padding around all widgets
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill="both", expand=True)
+        
+        # Message
+        ttk.Label(
+            frame, 
+            text=message,
+            font=("Helvetica", 12),
+            wraplength=250
+        ).pack(pady=(0, 20))
+        
+        # Dismiss button
+        ttk.Button(
+            frame, 
+            text="Dismiss", 
+            command=self.destroy,
+            padding=5
+        ).pack()
+        
+        # Center the popup on the screen
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        
+        # Auto-dismiss after specified milliseconds
+        if auto_dismiss_ms > 0:
+            self.after(auto_dismiss_ms, self.destroy)
 
 class SessionPage(tk.Frame):
     def __init__(self, parent, controller):
@@ -229,7 +268,7 @@ class SessionPage(tk.Frame):
             self.timer_id = None
             
             if self.controller.current_session < len(self.controller.session_types):
-                messagebox.showinfo("SR Ended", "SR period has ended.")
+                NonBlockingPopup(self, "SR Ended", "SR period has ended.")
     
     def toggle_pause(self):
         paused = self.controller.pause_data_collection()
@@ -282,7 +321,7 @@ class SessionPage(tk.Frame):
             else:
                 # End of all sessions
                 self.controller.stop_data_collection()
-                messagebox.showinfo("Complete", "All sessions completed. Data has been saved.")
+                NonBlockingPopup(self, "Complete", "All sessions completed. Data has been saved.")
                 self.controller.destroy()
     
     def show_begin_session_popup(self):
@@ -419,7 +458,7 @@ class SessionPage(tk.Frame):
     
     def show_notification(self, message):
         """Show a notification to the participant"""
-        messagebox.showinfo("Notification", message)
+        NonBlockingPopup(self, "Notification", message)
         
         # Update Firebase database
         try:
