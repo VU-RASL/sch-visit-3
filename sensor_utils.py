@@ -58,8 +58,8 @@ def simulate_imu_data(time_val):
     
     return [qw, qx, qy, qz, roll, pitch, yaw]
 
-def simulate_tcp_data(time_val):
-    """Simulate TCP sensor data"""
+def simulate_osc_data(time_val):
+    """Simulate OSC sensor data"""
     value1 = math.sin(time_val * 0.1) * 10
     value2 = math.cos(time_val * 0.2) * 5
     value3 = math.sin(time_val * 0.3) * 2
@@ -88,8 +88,8 @@ def collect_sensor_data(sensors, data_queue, running, paused):
                 # Generate simulated data based on sensor type
                 if "BLE_IMU" in sensor_id:
                     data = simulate_imu_data(current_time)
-                elif "TCP" in sensor_id:
-                    data = simulate_tcp_data(current_time)
+                elif "OSC" in sensor_id:
+                    data = simulate_osc_data(current_time)
                 elif "Audio" in sensor_id:
                     data = simulate_audio_data(current_time)
                 else:
@@ -242,7 +242,7 @@ def get_sensor_file_header(sensor_id):
     """Get the CSV header for a specific sensor type"""
     if "BLE_IMU" in sensor_id:
         return "timestamp,qw,qx,qy,qz,roll,pitch,yaw"
-    elif "TCP" in sensor_id:
+    elif "OSC" in sensor_id:
         return "timestamp,value1,value2,value3"
     elif "Audio" in sensor_id:
         return "timestamp,amplitude,frequency"
@@ -323,7 +323,7 @@ def get_recent_sensor_data(seconds=5):
     recent_data = {
         "timestamp_range": (min_timestamp, current_time),
         "imu_sensors": {},
-        "tcp_sensors": {},
+        "osc_sensors": {},
         "audio_sensors": {}
     }
     
@@ -344,8 +344,8 @@ def get_recent_sensor_data(seconds=5):
                 "timestamps": [ts for ts, _ in recent_sensor_data],
                 "data": [d for _, d in recent_sensor_data]
             }
-        elif "TCP" in sensor_id:
-            recent_data["tcp_sensors"][sensor_id] = {
+        elif "OSC" in sensor_id:
+            recent_data["osc_sensors"][sensor_id] = {
                 "timestamps": [ts for ts, _ in recent_sensor_data],
                 "data": [d for _, d in recent_sensor_data]
             }
@@ -399,7 +399,7 @@ def get_samples():
 
     # Count samples for each sensor type
     imu_sample_count = 0
-    tcp_sample_count = 0
+    osc_sample_count = 0
     audio_sample_count = 0
     
     # Count IMU sensor samples per device
@@ -409,9 +409,9 @@ def get_samples():
         imu_samples_by_device[device_name] = len(sensor_data["data"])
         imu_sample_count += len(sensor_data["data"])
     
-    # Count TCP sensor samples
-    for sensor_id, sensor_data in recent_data["tcp_sensors"].items():
-        tcp_sample_count += len(sensor_data["data"])
+    # Count OSC sensor samples
+    for sensor_id, sensor_data in recent_data["osc_sensors"].items():
+        osc_sample_count += len(sensor_data["data"])
     
     # Count Audio sensor samples
     for sensor_id, sensor_data in recent_data["audio_sensors"].items():
@@ -421,9 +421,9 @@ def get_samples():
     sample_counts = {
         "imu_samples": imu_sample_count,
         "imu_samples_by_device": imu_samples_by_device,
-        "tcp_samples": tcp_sample_count,
+        "osc_samples": osc_sample_count,
         "audio_samples": audio_sample_count,
-        "total_samples": imu_sample_count + tcp_sample_count + audio_sample_count
+        "total_samples": imu_sample_count + osc_sample_count + audio_sample_count
     }
 
     print("Sample counts:")
@@ -431,7 +431,7 @@ def get_samples():
     print("IMU samples by device:")
     for device, count in imu_samples_by_device.items():
         print(f"  {device}: {count} samples")
-    print(f"TCP samples: {tcp_sample_count}")
+    print(f"OSC samples: {osc_sample_count}")
     print(f"Audio samples: {audio_sample_count}")
     print(f"Total samples: {sample_counts['total_samples']}")
 

@@ -52,14 +52,14 @@ class SensorPage(tk.Frame):
         ttk.Radiobutton(ble_frame, text="Simulate 5 IMU Sensors", variable=self.ble_var, 
                         value="simulate", padding=5).pack(anchor="w", pady=5, padx=10)
         
-        # TCP Sensors
-        tcp_frame = ttk.LabelFrame(sensor_frame, text="TCP Sensors")
-        tcp_frame.pack(pady=10, padx=15, fill="x")
+        # OSC Sensors
+        osc_frame = ttk.LabelFrame(sensor_frame, text="OSC Sensors")
+        osc_frame.pack(pady=10, padx=15, fill="x")
         
-        self.tcp_var = tk.StringVar(value="simulate")
-        ttk.Radiobutton(tcp_frame, text="Connect to Real TCP Sensors", variable=self.tcp_var, 
+        self.osc_var = tk.StringVar(value="simulate")
+        ttk.Radiobutton(osc_frame, text="Connect to Real OSC Sensors", variable=self.osc_var, 
                         value="real", padding=5).pack(anchor="w", pady=5, padx=10)
-        ttk.Radiobutton(tcp_frame, text="Simulate 2 TCP Sensors", variable=self.tcp_var, 
+        ttk.Radiobutton(osc_frame, text="Simulate 2 OSC Sensors", variable=self.osc_var, 
                         value="simulate", padding=5).pack(anchor="w", pady=5, padx=10)
         
         # Audio Sensor
@@ -80,7 +80,7 @@ class SensorPage(tk.Frame):
         self.status_indicators = {}
         sensors = [("BLE_IMU_1", 0, 0), ("BLE_IMU_2", 0, 1), ("BLE_IMU_3", 0, 2), 
                   ("BLE_IMU_4", 0, 3), ("BLE_IMU_5", 0, 4),
-                  ("TCP_1", 1, 0), ("TCP_2", 1, 1), 
+                  ("OSC_1", 1, 0), ("OSC_2", 1, 1), 
                   ("Audio_1", 1, 2)]
                   
         for sensor_id, row, col in sensors:
@@ -229,19 +229,19 @@ class SensorPage(tk.Frame):
             self.status_indicators[sensor_id].config(bg="green")
     
     def setup_other_sensors(self):
-        # TCP Sensors
-        if self.tcp_var.get() == "simulate":
+        # OSC Sensors
+        if self.osc_var.get() == "simulate":
             for i in range(2):
-                sensor_id = f"TCP_{i+1}"
+                sensor_id = f"OSC_{i+1}"
                 self.controller.sensors[sensor_id] = {
                     "type": "simulated",
                     "connected": True
                 }
                 self.status_indicators[sensor_id].config(bg="green")
         else:
-            # Connect to real TCP sensors (not implemented yet)
+            # Connect to real OSC sensors (not implemented yet)
             for i in range(2):
-                sensor_id = f"TCP_{i+1}"
+                sensor_id = f"OSC_{i+1}"
                 self.controller.sensors[sensor_id] = {
                     "type": "simulated",  # Change to "real" when implemented
                     "connected": True

@@ -440,7 +440,7 @@ class SessionPage(tk.Frame):
             if sample_counts:
                 self.ml_probability.config(
                     text=f"Samples: IMU={sample_counts['imu_samples']}, "
-                         f"TCP={sample_counts['tcp_samples']}, "
+                         f"OSC={sample_counts['osc_samples']}, "
                          f"Audio={sample_counts['audio_samples']}"
                 )
             else:
