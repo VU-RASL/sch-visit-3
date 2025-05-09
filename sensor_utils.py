@@ -517,6 +517,46 @@ def print_ble_roll(recent_data, ble_idx):
         print(f"No roll data available for BLE_IMU_{ble_idx}")
         return None
 
+def print_emotibit_ppg_ir(recent_data):
+    """
+    Print the PPG:IR values from EmotiBit sensor
+    
+    Args:
+        recent_data: Dictionary containing recent sensor data
+        
+    Returns:
+        List of PPG:IR values if sensor data exists, otherwise None
+    """
+    # Look for OSC_PPG:IR in the osc_sensors
+    ppg_ir_data = None
+    sensor_id = "OSC_PPG:IR"
+    
+    if "osc_sensors" in recent_data:
+        for sid, sensor_data in recent_data["osc_sensors"].items():
+            if sid == sensor_id:
+                ppg_ir_data = sensor_data
+                break
+    
+    if ppg_ir_data is None:
+        print("No data found for EmotiBit PPG:IR")
+        return None
+    
+    # Extract PPG:IR values (data is a list of lists, with one value per sample)
+    ppg_ir_values = []
+    for data_point in ppg_ir_data["data"]:
+        if len(data_point) >= 1:  # Make sure data has at least one element
+            ppg_ir_values.append(data_point[0])
+    
+    # Print the PPG:IR values
+    if ppg_ir_values:
+        print(f"PPG:IR values from EmotiBit:")
+        for i, value in enumerate(ppg_ir_values):
+            print(f"Sample {i+1}: {value:.2f}")
+        return ppg_ir_values
+    else:
+        print("No PPG:IR data available from EmotiBit")
+        return None
+
 def get_samples():
     """Get the last N seconds of sensor data for all sensors"""
     # Get recent sensor data
