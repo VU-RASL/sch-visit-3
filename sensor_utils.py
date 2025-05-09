@@ -357,6 +357,41 @@ def get_recent_sensor_data(seconds=5):
     
     return recent_data
 
+def print_ble_roll(recent_data, ble_idx):
+    """
+    Print the roll values from BLE_IMU sensor
+    
+    Returns:
+        List of roll values if sensor data exists, otherwise None
+    """
+    
+    # Look for BLE_IMU_ble_idx in the imu_sensors
+    ble_data = None
+    for sensor_id, sensor_data in recent_data["imu_sensors"].items():
+        if sensor_id == f"BLE_IMU_{ble_idx}" or (sensor_id.startswith("BLE_IMU") and f"{ble_idx}" in sensor_id):
+            ble_data = sensor_data
+            break
+    
+    if ble_data is None:
+        print(f"No data found for BLE_IMU_{ble_idx}")
+        return None
+    
+    # Extract roll values (roll is at index 4 in IMU data format [qw, qx, qy, qz, roll, pitch, yaw])
+    roll_values = []
+    for data_point in ble_data["data"]:
+        if len(data_point) >= 5:  # Make sure data has enough elements
+            roll_values.append(data_point[4])
+    
+    # Print the roll values
+    if roll_values:
+        print(f"Roll values from BLE_IMU_{ble_idx}:")
+        for i, roll in enumerate(roll_values):
+            print(f"Sample {i+1}: {roll:.4f} degrees")
+        return roll_values
+    else:
+        print(f"No roll data available for BLE_IMU_{ble_idx}")
+        return None
+
 def get_samples():
     """Get the last N seconds of sensor data for all sensors"""
     # Get recent sensor data
