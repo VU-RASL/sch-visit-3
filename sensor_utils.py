@@ -10,10 +10,18 @@ import asyncio
 import struct
 from scipy.spatial.transform import Rotation
 from audio_utils import process_audio_data
+import threading
+import atexit
 
 # Data buffer to store recent sensor data
 sensor_data_buffer = {}
 buffer_max_age = 60  # Maximum age of data to keep in buffer (seconds)
+
+# Batching system for file I/O operations
+file_write_batches = {}
+file_batch_lock = threading.Lock()
+FILE_BATCH_SIZE = 50  # Number of samples to batch before writing
+FILE_BATCH_TIMEOUT = 1.0  # Maximum time (seconds) to hold data before forced write
 
 # UUIDs for BLE characteristics (from test.py)
 UUID_A = "F00044DC-0451-4000-B000-000000000000"  # Data characteristic
@@ -23,6 +31,13 @@ UUID_SERVICE = "F0002642-0451-4000-B000-000000000000"  # Service UUID
 # Global variables for BLE
 ble_devices = []
 freq = 100  # Default frequency
+
+# File batch worker thread
+file_batch_thread = None
+file_batch_stop_event = threading.Event()
+
+# Register cleanup function to run at exit
+atexit.register(lambda: cleanup_sensor_system())
 
 def simulate_imu_data(time_val):
     """Simulate IMU sensor data"""
@@ -129,13 +144,153 @@ def collect_sensor_data(sensors, data_queue, running, paused):
                     except Exception as e:
                         print(f"Error processing audio data: {str(e)}")
 
+def start_file_batch_writer():
+    """Start the background thread for batch file writing"""
+    global file_batch_thread, file_batch_stop_event
+    
+    if file_batch_thread is not None and file_batch_thread.is_alive():
+        return  # Thread already running
+    
+    file_batch_stop_event = threading.Event()
+    file_batch_thread = threading.Thread(target=file_batch_worker, daemon=True)
+    file_batch_thread.start()
+
+def stop_file_batch_writer():
+    """Stop the background thread for batch file writing"""
+    global file_batch_thread, file_batch_stop_event
+    
+    if file_batch_thread is not None and file_batch_thread.is_alive():
+        file_batch_stop_event.set()
+        file_batch_thread.join(timeout=2.0)
+        
+        # Flush any remaining data
+        with file_batch_lock:
+            for file_key, batch_info in file_write_batches.items():
+                if batch_info["data"]:
+                    write_batch_to_file(file_key)
+        
+        file_batch_thread = None
+
+def file_batch_worker():
+    """Background worker that periodically writes batched data to files"""
+    last_check_time = time.time()
+    
+    while not file_batch_stop_event.is_set():
+        current_time = time.time()
+        flush_needed = False
+        
+        # Check if any batches need to be written due to timeout
+        if current_time - last_check_time >= 0.1:  # Check every 100ms
+            with file_batch_lock:
+                for file_key, batch_info in list(file_write_batches.items()):
+                    if (batch_info["data"] and 
+                        (current_time - batch_info["last_update"] >= FILE_BATCH_TIMEOUT or 
+                         len(batch_info["data"]) >= FILE_BATCH_SIZE)):
+                        write_batch_to_file(file_key)
+                        flush_needed = True
+            
+            last_check_time = current_time
+        
+        # Sleep a bit to avoid busy waiting
+        time.sleep(0.01)
+
+def write_batch_to_file(file_key):
+    """Write a batch of data to a file"""
+    if file_key not in file_write_batches:
+        return
+    
+    batch_info = file_write_batches[file_key]
+    if not batch_info["data"]:
+        return
+    
+    data_dir, filename = file_key
+    full_path = os.path.join(data_dir, filename)
+    
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs(data_dir, exist_ok=True)
+        
+        # Check if we need to write a header
+        file_exists = os.path.exists(full_path) and os.path.getsize(full_path) > 0
+        
+        # Open the file with explicit closing to ensure file handles are released
+        f = None
+        try:
+            f = open(full_path, "a")
+            if not file_exists:
+                # Write header if file is new
+                f.write(batch_info["header"] + "\n")
+            
+            # Write all data at once
+            f.write("".join(batch_info["data"]))
+            
+            # Explicitly flush to ensure data is written
+            f.flush()
+        finally:
+            # Ensure file is closed even if an error occurs
+            if f is not None:
+                f.close()
+        
+        # Clear the batch after successful write
+        batch_info["data"] = []
+        
+    except Exception as e:
+        print(f"Error writing batch to file {full_path}: {str(e)}")
+        # Don't clear the batch on error, so we can retry later
+
+def get_sensor_file_header(sensor_id):
+    """Get the CSV header for a specific sensor type"""
+    if "BLE_IMU" in sensor_id:
+        return "timestamp,qw,qx,qy,qz,roll,pitch,yaw"
+    elif "TCP" in sensor_id:
+        return "timestamp,value1,value2,value3"
+    elif "Audio" in sensor_id:
+        return "timestamp,amplitude,frequency"
+    return "timestamp,data"
+
+def add_to_write_batch(sensor_id, timestamp, data, data_dir):
+    """Add a data item to the write batch for a specific sensor"""
+    # Get device name for BLE sensors
+    device_name = ""
+    if "BLE_IMU" in sensor_id:
+        for device in ble_devices:
+            if device.idx == int(sensor_id.split("_")[-1]) - 1:  # Subtract 1 to convert from 1-based to 0-based indexing
+                device_name = f"_{device.name}"
+                break
+    
+    # Create filename
+    filename = f"{sensor_id}{device_name}.csv"
+    file_key = (data_dir, filename)
+    
+    # Format data for writing
+    formatted_data = [f"{x:.3f}" for x in data]
+    formatted_timestamp = f"{timestamp:.3f}"
+    line = f"{formatted_timestamp},{','.join(formatted_data)}\n"
+    
+    with file_batch_lock:
+        # Initialize batch if it doesn't exist
+        if file_key not in file_write_batches:
+            file_write_batches[file_key] = {
+                "data": [],
+                "header": get_sensor_file_header(sensor_id),
+                "last_update": time.time()
+            }
+        
+        # Add line to batch
+        file_write_batches[file_key]["data"].append(line)
+        file_write_batches[file_key]["last_update"] = time.time()
+        
+        # Write immediately if batch is full
+        if len(file_write_batches[file_key]["data"]) >= FILE_BATCH_SIZE:
+            write_batch_to_file(file_key)
+
 def process_sensor_data(data_item, data_dir, current_session, session_types):
     """Process and save sensor data"""
     sensor_id = data_item["sensor_id"]
     timestamp = data_item["timestamp"]
     data = data_item["data"]
     
-    # Add data to buffer
+    # Add data to in-memory buffer
     if sensor_id not in sensor_data_buffer:
         sensor_data_buffer[sensor_id] = []
     
@@ -148,37 +303,8 @@ def process_sensor_data(data_item, data_dir, current_session, session_types):
         if current_time - ts <= buffer_max_age
     ]
     
-    # Get device name for BLE sensors
-    device_name = ""
-    if "BLE_IMU" in sensor_id:
-        for device in ble_devices:
-            if device.idx == int(sensor_id.split("_")[-1]) - 1:  # Subtract 1 to convert from 1-based to 0-based indexing
-                device_name = f"_{device.name}"
-                break
-    
-    # Create filename based on sensor type only
-    filename = os.path.join(data_dir, f"{sensor_id}{device_name}.csv")
-    
-    try:
-        # Append data to file
-        with open(filename, "a") as f:
-            if os.path.getsize(filename) == 0:
-                # Write header if file is empty
-                if "BLE_IMU" in sensor_id:
-                    f.write("timestamp,qw,qx,qy,qz,roll,pitch,yaw\n")
-                elif "TCP" in sensor_id:
-                    f.write("timestamp,value1,value2,value3\n")
-                elif "Audio" in sensor_id:
-                    f.write("timestamp,amplitude,frequency\n")
-            
-            # Format all numeric values to 2 decimal places
-            formatted_data = [f"{x:.3f}" for x in data]
-            formatted_timestamp = f"{timestamp:.3f}"
-            
-            # Write data
-            f.write(f"{formatted_timestamp},{','.join(formatted_data)}\n")
-    except Exception as e:
-        print(f"Error saving sensor data: {str(e)}")
+    # Add to write batch (batch file I/O)
+    add_to_write_batch(sensor_id, timestamp, data, data_dir)
 
 def get_recent_sensor_data(seconds=5):
     """
@@ -292,6 +418,10 @@ def run_ml_prediction(participant_data):
 async def connect_ble_sensors():
     """Connect to real BLE sensors using code from test.py"""
     global ble_devices, freq
+    
+    # Ensure the batch file writer thread is running
+    if file_batch_thread is None or not file_batch_thread.is_alive():
+        start_file_batch_writer()
     
     # Scan for BLE devices
     devices = await BleakScanner.discover()
@@ -460,3 +590,26 @@ class BLEDevice:
             out[i, 7:10] = eul
             
         return out
+
+# Add a cleanup function to ensure proper shutdown
+def cleanup_sensor_system():
+    """Cleanup function to ensure proper shutdown of sensor system."""
+    # Stop the file batch writer thread
+    stop_file_batch_writer()
+    
+    # Flush any remaining data in batches
+    with file_batch_lock:
+        for file_key, batch_info in list(file_write_batches.items()):
+            if batch_info["data"]:
+                write_batch_to_file(file_key)
+    
+    print("Sensor system cleanup completed.")
+
+def init_sensor_system():
+    """Initialize the sensor system"""
+    # Start the background file writer thread
+    start_file_batch_writer()
+    return True
+
+# Initialize the system when module is imported
+init_sensor_system()
