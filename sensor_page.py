@@ -57,9 +57,9 @@ class SensorPage(tk.Frame):
         osc_frame.pack(pady=10, padx=15, fill="x")
         
         self.osc_var = tk.StringVar(value="simulate")
-        ttk.Radiobutton(osc_frame, text="Connect to Real OSC Sensors", variable=self.osc_var, 
+        ttk.Radiobutton(osc_frame, text="Connect to Real EmotiBit OSC Sensors", variable=self.osc_var, 
                         value="real", padding=5).pack(anchor="w", pady=5, padx=10)
-        ttk.Radiobutton(osc_frame, text="Simulate 2 OSC Sensors", variable=self.osc_var, 
+        ttk.Radiobutton(osc_frame, text="Simulate EmotiBit OSC Sensors", variable=self.osc_var, 
                         value="simulate", padding=5).pack(anchor="w", pady=5, padx=10)
         
         # Audio Sensor
@@ -80,7 +80,7 @@ class SensorPage(tk.Frame):
         self.status_indicators = {}
         sensors = [("BLE_IMU_1", 0, 0), ("BLE_IMU_2", 0, 1), ("BLE_IMU_3", 0, 2), 
                   ("BLE_IMU_4", 0, 3), ("BLE_IMU_5", 0, 4),
-                  ("OSC_1", 1, 0), ("OSC_2", 1, 1), 
+                  ("OSC_EmotiBit", 1, 0), 
                   ("Audio_1", 1, 2)]
                   
         for sensor_id, row, col in sensors:
@@ -229,24 +229,64 @@ class SensorPage(tk.Frame):
             self.status_indicators[sensor_id].config(bg="green")
     
     def setup_other_sensors(self):
-        # OSC Sensors
+        # OSC Sensors - EmotiBit
+        from sensor_utils import EMOTIBIT_SIGNAL_TYPES, EmotiBitConnector
+        
         if self.osc_var.get() == "simulate":
-            for i in range(2):
-                sensor_id = f"OSC_{i+1}"
+            # Add a single entry for the EmotiBit connection status
+            self.controller.sensors["OSC_EmotiBit"] = {
+                "type": "simulated",
+                "connected": True
+            }
+            self.status_indicators["OSC_EmotiBit"].config(bg="green")
+            
+            # Create individual sensor entries for each EmotiBit signal
+            for signal_type in EMOTIBIT_SIGNAL_TYPES.keys():
+                sensor_id = f"OSC_{signal_type}"
                 self.controller.sensors[sensor_id] = {
                     "type": "simulated",
                     "connected": True
                 }
-                self.status_indicators[sensor_id].config(bg="green")
         else:
-            # Connect to real OSC sensors (not implemented yet)
-            for i in range(2):
-                sensor_id = f"OSC_{i+1}"
-                self.controller.sensors[sensor_id] = {
-                    "type": "simulated",  # Change to "real" when implemented
+            # Create EmotiBit connector
+            emotibit_connector = EmotiBitConnector()
+            
+            # Try to connect to real EmotiBit via OSC
+            success = emotibit_connector.connect()
+            
+            # Update status based on connection success
+            if success:
+                # Add a single entry for the EmotiBit connection status
+                self.controller.sensors["OSC_EmotiBit"] = {
+                    "type": "real",
+                    "connected": True,
+                    "connector": emotibit_connector  # Store connector for later use
+                }
+                self.status_indicators["OSC_EmotiBit"].config(bg="green")
+                
+                # Create individual sensor entries for each EmotiBit signal
+                for signal_type in EMOTIBIT_SIGNAL_TYPES.keys():
+                    sensor_id = f"OSC_{signal_type}"
+                    self.controller.sensors[sensor_id] = {
+                        "type": "real",
+                        "connected": True
+                    }
+            else:
+                print("Failed to connect to EmotiBit and fallback to simulation")
+                # Fall back to simulation if connection fails
+                self.controller.sensors["OSC_EmotiBit"] = {
+                    "type": "simulated",
                     "connected": True
                 }
-                self.status_indicators[sensor_id].config(bg="green")
+                self.status_indicators["OSC_EmotiBit"].config(bg="yellow")
+                
+                # Create individual sensor entries for each EmotiBit signal
+                for signal_type in EMOTIBIT_SIGNAL_TYPES.keys():
+                    sensor_id = f"OSC_{signal_type}"
+                    self.controller.sensors[sensor_id] = {
+                        "type": "simulated",
+                        "connected": True
+                    }
         
         # Audio Sensor
         if self.audio_var.get() == "simulate":
@@ -281,6 +321,16 @@ class SensorPage(tk.Frame):
     def finish_connection(self):
         # Start data collection (this will create the data directory)
         self.controller.start_data_collection()
+        
+        # Sync any buffered EmotiBit data
+        if "OSC_EmotiBit" in self.controller.sensors:
+            osc_sensor = self.controller.sensors["OSC_EmotiBit"]
+            if osc_sensor["type"] == "real" and "connector" in osc_sensor:
+                try:
+                    # Sync any buffered data
+                    osc_sensor["connector"].sync_buffered_data(self.controller.data_queue)
+                except Exception as e:
+                    print(f"Error syncing EmotiBit buffered data: {str(e)}")
         
         # Now that data directory is created, start audio recording if using real audio
         if self.audio_var.get() == "real" and "Audio_1" in self.controller.sensors:

@@ -15,7 +15,7 @@ import atexit
 
 # Data buffer to store recent sensor data
 sensor_data_buffer = {}
-buffer_max_age = 60  # Maximum age of data to keep in buffer (seconds)
+buffer_max_age = 10  # Maximum age of data to keep in buffer (seconds) - older data will be removed
 
 # Batching system for file I/O operations
 file_write_batches = {}
@@ -38,6 +38,65 @@ file_batch_stop_event = threading.Event()
 
 # Register cleanup function to run at exit
 atexit.register(lambda: cleanup_sensor_system())
+
+# Define sampling rates and buffer sizes for EmotiBit sensors
+EMOTIBIT_SAMPLING_RATES = {
+    "motion": 25,  # AX, AY, AZ, GX, GY, GZ, MX, MY, MZ at 25Hz
+    "ppg": 25,     # PI, PG, PR at 25Hz
+    "temperature": 7.5,  # T0, TH at 7.5Hz
+    "eda": 15      # EA, EL, ER at 15Hz
+}
+
+# EmotiBit OSC signal types mapped to human-readable names
+EMOTIBIT_SIGNAL_TYPES = {
+    # Motion signals
+    "ACC:X": "Accelerometer X",
+    "ACC:Y": "Accelerometer Y", 
+    "ACC:Z": "Accelerometer Z",
+    "GYRO:X": "Gyroscope X",
+    "GYRO:Y": "Gyroscope Y",
+    "GYRO:Z": "Gyroscope Z",
+    "MAG:X": "Magnetometer X",
+    "MAG:Y": "Magnetometer Y",
+    "MAG:Z": "Magnetometer Z",
+    
+    # PPG signals
+    "PPG:RED": "PPG Red",
+    "PPG:IR": "PPG Infrared",
+    "PPG:GRN": "PPG Green",
+    
+    # Temperature signals
+    "TEMP": "Temperature",
+    "TEMP:T1": "Temperature T1",
+    "THERM": "Thermopile",
+    
+    # EDA signals
+    "EDA": "Electrodermal Activity",
+    "EDL": "Electrodermal Level",
+    "EDR": "Electrodermal Response",
+    
+    # Derived metrics
+    "SCR:AMP": "SCR Amplitude",
+    "SCR:RISE": "SCR Rise Time",
+    "SCR:FREQ": "SCR Frequency",
+    
+    # Heart metrics
+    "HR": "Heart Rate",
+    "IBI": "Inter-beat Interval",
+    
+    # Humidity
+    "HUMIDITY": "Humidity"
+}
+
+# Global variables for EmotiBit OSC
+emotibit_osc_server = None
+emotibit_data_buffers = {}
+emotibit_active_signals = []
+emotibit_connected = False
+
+# Global variables for data collection
+data_queue = None
+sensors = None
 
 def simulate_imu_data(time_val):
     """Simulate IMU sensor data"""
@@ -73,13 +132,39 @@ def simulate_audio_data(time_val):
     
     return [amplitude, frequency]
 
-def collect_sensor_data(sensors, data_queue, running, paused):
+def collect_sensor_data(sensors_dict, queue, running, paused):
     """Collect data from all sensors and put in queue"""
+    global data_queue, sensors
+    
+    # Store these as module variables so they can be accessed by handlers
+    # since the handlers are called outside of this function's context
+    data_queue = queue
+    sensors = sensors_dict
+    
     if not running or paused:
         return
     
     # Get current time
     current_time = time.time()
+    
+    # Sync any buffered EmotiBit data every second
+    if "OSC_EmotiBit" in sensors and sensors["OSC_EmotiBit"]["connected"]:
+        sensor_info = sensors["OSC_EmotiBit"]
+        if sensor_info["type"] == "real" and "connector" in sensor_info:
+            # Use a timestamp-based approach to sync only once per second
+            if not hasattr(collect_sensor_data, "last_sync_time"):
+                collect_sensor_data.last_sync_time = 0
+            
+            if current_time - collect_sensor_data.last_sync_time >= 1.0:
+                try:
+                    # First trim buffers to remove old data
+                    sensor_info["connector"].trim_buffers()
+                    
+                    # Don't clear the buffer, as the OSC thread might still be adding to it
+                    sensor_info["connector"].sync_buffered_data(data_queue, clear_buffer=False)
+                    collect_sensor_data.last_sync_time = current_time
+                except Exception as e:
+                    print(f"Error syncing EmotiBit data: {str(e)}")
     
     # Collect data from all sensors
     for sensor_id, sensor_info in sensors.items():
@@ -88,8 +173,13 @@ def collect_sensor_data(sensors, data_queue, running, paused):
                 # Generate simulated data based on sensor type
                 if "BLE_IMU" in sensor_id:
                     data = simulate_imu_data(current_time)
-                elif "OSC" in sensor_id:
+                elif "OSC_" in sensor_id and sensor_id.count('_') == 1:
+                    # The old style OSC generic simulation
                     data = simulate_osc_data(current_time)
+                elif "OSC_" in sensor_id:
+                    # EmotiBit-style OSC simulation for specific signals
+                    signal_type = sensor_id.replace("OSC_", "")
+                    data = [simulate_emotibit_data(signal_type, current_time)]
                 elif "Audio" in sensor_id:
                     data = simulate_audio_data(current_time)
                 else:
@@ -143,6 +233,33 @@ def collect_sensor_data(sensors, data_queue, running, paused):
                                 })
                     except Exception as e:
                         print(f"Error processing audio data: {str(e)}")
+                # Note: OSC sensors with type="real" don't need handling here
+                # they're automatically handled by the emotibit_handler callback
+
+def simulate_emotibit_data(signal_type, time_val):
+    """Simulate EmotiBit sensor data for a specific signal type"""
+    if "ACC:" in signal_type:
+        return math.sin(time_val * 0.5) * 0.5  # Simulate accelerometer data
+    elif "GYRO:" in signal_type:
+        return math.cos(time_val * 0.3) * 10.0  # Simulate gyroscope data
+    elif "MAG:" in signal_type:
+        return math.sin(time_val * 0.1) * 50.0  # Simulate magnetometer data
+    elif "PPG:" in signal_type:
+        return math.sin(time_val * 1.0) * 100.0 + 500.0  # Simulate PPG signal
+    elif "TEMP" in signal_type or "THERM" in signal_type:
+        return 36.5 + math.sin(time_val * 0.05) * 0.5  # Simulate temperature ~37°C
+    elif "ED" in signal_type:  # EDA, EDL, EDR
+        return 2.0 + math.sin(time_val * 0.2) * 0.5  # Simulate EDA around 2 µS
+    elif "SCR:" in signal_type:
+        return math.sin(time_val * 0.3) * 0.2  # Simulate SCR metrics
+    elif "HR" == signal_type:
+        return 70.0 + math.sin(time_val * 0.1) * 5.0  # Simulate HR ~70 BPM
+    elif "IBI" == signal_type:
+        return 0.85 + math.sin(time_val * 0.1) * 0.05  # Simulate IBI ~850ms
+    elif "HUMIDITY" == signal_type:
+        return 40.0 + math.sin(time_val * 0.05) * 5.0  # Simulate humidity ~40%
+    else:
+        return math.sin(time_val * 0.2) * 5.0  # Default simulation
 
 def start_file_batch_writer():
     """Start the background thread for batch file writing"""
@@ -242,8 +359,16 @@ def get_sensor_file_header(sensor_id):
     """Get the CSV header for a specific sensor type"""
     if "BLE_IMU" in sensor_id:
         return "timestamp,qw,qx,qy,qz,roll,pitch,yaw"
-    elif "OSC" in sensor_id:
-        return "timestamp,value1,value2,value3"
+    elif "OSC_" in sensor_id and sensor_id.count('_') == 1:
+        # Old generic OSC style
+        return "timestamp,value"
+    elif "OSC_" in sensor_id:
+        # EmotiBit-style OSC for specific signals
+        signal_type = sensor_id.replace("OSC_", "")
+        if signal_type in EMOTIBIT_SIGNAL_TYPES:
+            return f"timestamp,{EMOTIBIT_SIGNAL_TYPES[signal_type]}"
+        else:
+            return "timestamp,value"
     elif "Audio" in sensor_id:
         return "timestamp,amplitude,frequency"
     return "timestamp,data"
@@ -344,7 +469,7 @@ def get_recent_sensor_data(seconds=5):
                 "timestamps": [ts for ts, _ in recent_sensor_data],
                 "data": [d for _, d in recent_sensor_data]
             }
-        elif "OSC" in sensor_id:
+        elif "OSC_" in sensor_id:
             recent_data["osc_sensors"][sensor_id] = {
                 "timestamps": [ts for ts, _ in recent_sensor_data],
                 "data": [d for _, d in recent_sensor_data]
@@ -410,8 +535,16 @@ def get_samples():
         imu_sample_count += len(sensor_data["data"])
     
     # Count OSC sensor samples
+    osc_samples_by_signal = {}
     for sensor_id, sensor_data in recent_data["osc_sensors"].items():
-        osc_sample_count += len(sensor_data["data"])
+        signal_count = len(sensor_data["data"])
+        osc_sample_count += signal_count
+        
+        # For EmotiBit signals, track by signal type
+        if sensor_id.replace("OSC_", "") in EMOTIBIT_SIGNAL_TYPES:
+            signal_type = sensor_id.replace("OSC_", "")
+            signal_name = EMOTIBIT_SIGNAL_TYPES[signal_type]
+            osc_samples_by_signal[signal_name] = signal_count
     
     # Count Audio sensor samples
     for sensor_id, sensor_data in recent_data["audio_sensors"].items():
@@ -422,6 +555,7 @@ def get_samples():
         "imu_samples": imu_sample_count,
         "imu_samples_by_device": imu_samples_by_device,
         "osc_samples": osc_sample_count,
+        "osc_samples_by_signal": osc_samples_by_signal,
         "audio_samples": audio_sample_count,
         "total_samples": imu_sample_count + osc_sample_count + audio_sample_count
     }
@@ -431,7 +565,10 @@ def get_samples():
     print("IMU samples by device:")
     for device, count in imu_samples_by_device.items():
         print(f"  {device}: {count} samples")
-    print(f"OSC samples: {osc_sample_count}")
+    print(f"Total OSC samples: {osc_sample_count}")
+    print("OSC samples by signal:")
+    for signal, count in osc_samples_by_signal.items():
+        print(f"  {signal}: {count} samples")
     print(f"Audio samples: {audio_sample_count}")
     print(f"Total samples: {sample_counts['total_samples']}")
 
@@ -626,25 +763,367 @@ class BLEDevice:
             
         return out
 
-# Add a cleanup function to ensure proper shutdown
+class EmotiBitConnector:
+    """Class to connect with EmotiBit OSC server and manage data"""
+    def __init__(self):
+        self.osc_server = None
+        self.is_connected = False
+        self.signals = {}
+        self.signal_counts = {}
+        self.last_cleanup_time = time.time()
+    
+    def connect(self):
+        """Connect to EmotiBit via OSC"""
+        try:
+            # Check if emotibit.py exists in the current directory
+            if not os.path.exists("emotibit.py"):
+                print("EmotiBit OSC server script not found")
+                return False
+            
+            # Start EmotiBit OSC server using setup_emotibit_osc
+            success = setup_emotibit_osc(enable=True)
+            if success:
+                self.is_connected = True
+                print("Successfully connected to EmotiBit OSC server")
+                return True
+            else:
+                self.is_connected = False
+                print("Failed to connect to EmotiBit OSC server")
+                return False
+        
+        except Exception as e:
+            print(f"Error connecting to EmotiBit OSC server: {str(e)}")
+            self.is_connected = False
+            return False
+    
+    def disconnect(self):
+        """Disconnect from EmotiBit OSC server"""
+        try:
+            # Stop EmotiBit OSC server
+            success = setup_emotibit_osc(enable=False)
+            self.is_connected = False
+            return success
+        except Exception as e:
+            print(f"Error disconnecting from EmotiBit OSC server: {str(e)}")
+            return False
+    
+    def trim_buffers(self):
+        """Trim all EmotiBit buffers to keep only recent data"""
+        if not self.is_connected:
+            return 0
+        
+        # Only perform cleanup periodically
+        current_time = time.time()
+        if current_time - self.last_cleanup_time < 5.0:  # Clean up every 5 seconds
+            return 0
+            
+        total_removed = 0
+        
+        # Clean up global EmotiBit buffers
+        for signal_type in list(emotibit_data_buffers.keys()):
+            if signal_type in emotibit_data_buffers:
+                buffer = emotibit_data_buffers[signal_type]
+                original_len = len(buffer)
+                
+                # Trim buffer to keep only recent data
+                emotibit_data_buffers[signal_type] = [
+                    (ts, v) for ts, v in buffer 
+                    if current_time - ts <= buffer_max_age
+                ]
+                
+                removed = original_len - len(emotibit_data_buffers[signal_type])
+                total_removed += removed
+        
+        self.last_cleanup_time = current_time
+        
+        if total_removed > 0:
+            print(f"Connector cleaned up {total_removed} outdated EmotiBit samples (older than {buffer_max_age}s)")
+            
+        return total_removed
+    
+    def get_available_signals(self):
+        """Get list of available signal types"""
+        return list(EMOTIBIT_SIGNAL_TYPES.keys())
+    
+    def get_signal_stats(self):
+        """Get statistics for each signal"""
+        # First trim buffers to get accurate stats
+        self.trim_buffers()
+        
+        stats = {}
+        
+        # Count samples for each signal type
+        for sensor_id, buffer in sensor_data_buffer.items():
+            if sensor_id.startswith("OSC_"):
+                signal_type = sensor_id.replace("OSC_", "")
+                if signal_type in EMOTIBIT_SIGNAL_TYPES:
+                    stats[signal_type] = {
+                        "count": len(buffer),
+                        "name": EMOTIBIT_SIGNAL_TYPES[signal_type]
+                    }
+        
+        # Also check the local emotibit buffers
+        for signal_type, buffer in emotibit_data_buffers.items():
+            if signal_type in EMOTIBIT_SIGNAL_TYPES:
+                stats[signal_type] = {
+                    "count": len(buffer),
+                    "name": EMOTIBIT_SIGNAL_TYPES[signal_type],
+                    "buffer_only": True
+                }
+        
+        return stats
+    
+    def sync_buffered_data(self, target_data_queue, clear_buffer=True):
+        """Process any buffered data and add it to the data queue
+        
+        Args:
+            target_data_queue: The queue to add data to
+            clear_buffer: Whether to clear the buffer after syncing (default: True)
+        
+        Returns:
+            Number of samples synced
+        """
+        if not self.is_connected:
+            return 0
+        
+        # Trim buffers first to avoid processing old data
+        self.trim_buffers()
+        
+        synced_count = 0
+        current_time = time.time()
+        
+        # Process each signal's buffered data
+        for signal_type, buffer in emotibit_data_buffers.items():
+            if not buffer:
+                continue
+                
+            # Trim buffer by timestamp first, to avoid processing old data
+            buffer_copy = [(ts, val) for ts, val in buffer if current_time - ts <= buffer_max_age]
+            
+            # Only continue if we have data after trimming
+            if not buffer_copy:
+                continue
+            
+            sensor_id = f"OSC_{signal_type}"
+            
+            # Process all buffered data
+            for timestamp, value in buffer_copy:
+                # Add to data queue
+                target_data_queue.put({
+                    "sensor_id": sensor_id,
+                    "timestamp": timestamp,
+                    "data": [value]
+                })
+                synced_count += 1
+            
+            # Clear the buffer after processing if requested
+            if clear_buffer:
+                buffer.clear()
+            else:
+                # If not clearing, at least update the buffer with age-limited version
+                emotibit_data_buffers[signal_type] = buffer_copy
+        return synced_count
+
+def emotibit_handler(signal_type, address, *args):
+    """Generic handler for all EmotiBit OSC messages"""
+    if args:
+        timestamp = time.time()
+        for value in args:
+            if isinstance(value, (int, float)):
+                # Create the sensor_id from the signal type
+                sensor_id = f"OSC_{signal_type}"
+                
+                # Always store in local buffer regardless of sensors dict state
+                # This ensures data is captured even before the app is fully set up
+                if signal_type not in emotibit_data_buffers:
+                    emotibit_data_buffers[signal_type] = []
+                
+                # Store the data with timestamp
+                emotibit_data_buffers[signal_type].append((timestamp, float(value)))
+                
+                # Trim buffer to keep only recent data, same as main sensor buffer
+                current_time = time.time()
+                emotibit_data_buffers[signal_type] = [
+                    (ts, v) for ts, v in emotibit_data_buffers[signal_type] 
+                    if current_time - ts <= buffer_max_age
+                ]
+                
+                # If sensors dict is available, add to data queue
+                global sensors, data_queue
+                if sensors is not None and data_queue is not None:
+                    try:
+                        for app_sensor_id, sensor_info in sensors.items():
+                            if app_sensor_id == sensor_id and sensor_info["connected"]:
+                                # In real data mode, we get a single value per message
+                                data_value = [float(value)]
+                                
+                                # Add to data queue
+                                data_queue.put({
+                                    "sensor_id": sensor_id,
+                                    "timestamp": timestamp,
+                                    "data": data_value
+                                })
+                                break
+                    except (AttributeError, TypeError):
+                        # Safely handle the case where sensors isn't ready yet
+                        pass
+
+def setup_emotibit_osc(enable=True):
+    """Initialize or stop the EmotiBit OSC server"""
+    global emotibit_osc_server, emotibit_connected, emotibit_active_signals, emotibit_data_buffers
+    
+    if enable:
+        # If server already exists, don't create another one
+        if emotibit_osc_server is not None:
+            print("EmotiBit OSC server is already running")
+            return True
+            
+        try:
+            from pythonosc import dispatcher
+            from pythonosc import osc_server
+            import threading
+            
+            # Reset the data buffers
+            emotibit_active_signals = []
+            
+            # Keep existing data if any, or initialize empty buffers
+            if not emotibit_data_buffers:
+                emotibit_data_buffers = {}
+            
+            # Create dispatcher
+            osc_dispatcher = dispatcher.Dispatcher()
+            
+            # Map OSC addresses to handler functions
+            for signal_type in EMOTIBIT_SIGNAL_TYPES.keys():
+                address = f"/EmotiBit/0/{signal_type}"
+                # Use a nested function to avoid the closure issue with the lambda
+                def create_handler(sig_type):
+                    return lambda addr, *args: emotibit_handler(sig_type, addr, *args)
+                
+                handler = create_handler(signal_type)
+                osc_dispatcher.map(address, handler)
+                emotibit_active_signals.append(signal_type)
+                
+                # Initialize buffer for each signal if it doesn't exist
+                if signal_type not in emotibit_data_buffers:
+                    emotibit_data_buffers[signal_type] = []
+            
+            # Set a default handler for unmapped addresses
+            osc_dispatcher.set_default_handler(lambda addr, *args: None)
+            
+            try:
+                # Create server with a timeout for operations
+                server = osc_server.ThreadingOSCUDPServer(
+                    ("127.0.0.1", 12345), osc_dispatcher)
+                server.timeout = 0.5  # Add a timeout to avoid blocking forever
+                
+                # Create a thread to run the server
+                server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                server_thread.start()
+                
+                # Start a buffer cleanup thread
+                cleanup_thread = threading.Thread(target=emotibit_buffer_cleanup_worker, daemon=True)
+                cleanup_thread.start()
+                
+                emotibit_osc_server = server
+                emotibit_connected = True
+                
+                print(f"EmotiBit OSC server listening on 127.0.0.1:12345")
+                print(f"Monitoring {len(emotibit_active_signals)} EmotiBit signals")
+                return True
+            except Exception as e:
+                print(f"Error starting EmotiBit OSC server: {str(e)}")
+                return False
+            
+        except Exception as e:
+            print(f"Error setting up EmotiBit OSC server: {str(e)}")
+            emotibit_connected = False
+            return False
+    
+    elif not enable:
+        if emotibit_osc_server is not None:
+            try:
+                # Stop the server
+                emotibit_osc_server.shutdown()
+                emotibit_osc_server.server_close()
+                emotibit_osc_server = None
+                emotibit_connected = False
+                print("EmotiBit OSC server stopped")
+                return True
+            except Exception as e:
+                print(f"Error stopping EmotiBit OSC server: {str(e)}")
+                return False
+        else:
+            # Server is already stopped
+            return True
+    
+    return True
+
+def emotibit_buffer_cleanup_worker():
+    """Background thread that periodically cleans up EmotiBit data buffers"""
+    cleanup_stop_event = threading.Event()
+    
+    try:
+        while not cleanup_stop_event.is_set() and emotibit_connected:
+            # Sleep for a short time
+            time.sleep(2.0)
+            
+            # Get current time
+            current_time = time.time()
+            
+            # Clean up all EmotiBit buffers
+            total_removed = 0
+            for signal_type in list(emotibit_data_buffers.keys()):
+                if signal_type in emotibit_data_buffers:
+                    buffer = emotibit_data_buffers[signal_type]
+                    original_len = len(buffer)
+                    
+                    # Trim buffer to keep only recent data
+                    emotibit_data_buffers[signal_type] = [
+                        (ts, v) for ts, v in buffer 
+                        if current_time - ts <= buffer_max_age
+                    ]
+                    
+                    removed = original_len - len(emotibit_data_buffers[signal_type])
+                    total_removed += removed
+            
+            if total_removed > 0:
+                print(f"Cleaned up {total_removed} outdated EmotiBit samples (older than {buffer_max_age}s)")
+                
+    except Exception as e:
+        print(f"Error in EmotiBit buffer cleanup worker: {str(e)}")
+
 def cleanup_sensor_system():
-    """Cleanup function to ensure proper shutdown of sensor system."""
-    # Stop the file batch writer thread
+    """Clean up resources when the system is shutting down"""
+    # Stop the file batch writer
     stop_file_batch_writer()
     
-    # Flush any remaining data in batches
-    with file_batch_lock:
-        for file_key, batch_info in list(file_write_batches.items()):
-            if batch_info["data"]:
-                write_batch_to_file(file_key)
+    # Stop EmotiBit OSC server if running
+    setup_emotibit_osc(enable=False)
     
-    print("Sensor system cleanup completed.")
+    # Disconnect all BLE devices
+    for device in ble_devices:
+        if hasattr(device, 'client') and device.client and device.client.is_connected:
+            try:
+                asyncio.get_event_loop().run_until_complete(device.disconnect())
+            except:
+                pass
+    
+    print("Sensor system cleanup complete")
 
 def init_sensor_system():
-    """Initialize the sensor system"""
-    # Start the background file writer thread
+    """Initialize sensor system"""
+    # Start the file batch writer thread
     start_file_batch_writer()
-    return True
+    
+    # Make sure pythonosc package is available
+    try:
+        import pythonosc
+    except ImportError:
+        print("Warning: pythonosc package not found. EmotiBit OSC will not work.")
+        print("Install with: pip install python-osc")
+    
+    print("Sensor system initialized")
 
 # Initialize the system when module is imported
 init_sensor_system()
