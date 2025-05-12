@@ -32,6 +32,19 @@ UUID_SERVICE = "F0002642-0451-4000-B000-000000000000"  # Service UUID
 ble_devices = []
 freq = 100  # Default frequency
 
+# BLE reconnection parameters
+BLE_RECONNECT_ATTEMPTS = 5  # Maximum reconnection attempts
+BLE_RECONNECT_DELAY = 3.0   # Initial delay between reconnection attempts (seconds)
+BLE_RECONNECT_MAX_DELAY = 30.0  # Maximum delay between attempts (seconds)
+BLE_CONNECTION_CHECK_INTERVAL = 5.0  # How often to check connection status (seconds)
+
+# Connection monitor thread
+ble_connection_monitor = None
+ble_monitor_stop_event = threading.Event()
+ble_main_event_loop = None  # Store reference to main thread's event loop
+ble_reconnection_lock = threading.Lock()  # Lock to prevent concurrent reconnections to the same device
+ble_reconnecting_devices = {}  # Track devices that are currently in reconnection process
+
 # File batch worker thread
 file_batch_thread = None
 file_batch_stop_event = threading.Event()
@@ -629,7 +642,10 @@ def run_ml_prediction(participant_data):
 # BLE connection utilities from test.py
 async def connect_ble_sensors():
     """Connect to real BLE sensors using code from test.py"""
-    global ble_devices, freq
+    global ble_devices, freq, ble_connection_monitor, ble_monitor_stop_event, ble_main_event_loop
+    
+    # Store reference to the current event loop (main thread's loop)
+    ble_main_event_loop = asyncio.get_event_loop()
     
     # Ensure the batch file writer thread is running
     if file_batch_thread is None or not file_batch_thread.is_alive():
@@ -645,7 +661,7 @@ async def connect_ble_sensors():
     # Create device objects for each BLE node
     ble_devices = []
     for i, device in enumerate(ble_nodes):
-        ble_devices.append(BLEDevice(device.address, device.name, i))
+        ble_devices.append(BLEDevice(device.address, device.name, i, ble_main_event_loop))
     
     # Connect to each device
     connected_devices = []
@@ -654,17 +670,156 @@ async def connect_ble_sensors():
         if success:
             connected_devices.append(device)
     
+    # Start the connection monitor if not already running
+    if (ble_connection_monitor is None or not ble_connection_monitor.is_alive()) and connected_devices:
+        ble_monitor_stop_event.clear()
+        ble_connection_monitor = threading.Thread(target=ble_connection_monitor_thread, daemon=True)
+        ble_connection_monitor.start()
+        print("BLE connection monitor started")
+    
     return connected_devices
+
+def ble_connection_monitor_thread():
+    """Background thread that monitors BLE connections and attempts reconnection"""
+    global ble_devices, ble_monitor_stop_event, ble_main_event_loop, ble_reconnecting_devices
+    
+    print("BLE connection monitor thread started")
+    
+    while not ble_monitor_stop_event.is_set():
+        try:
+            # Sleep at the start to give devices time to initialize
+            time.sleep(BLE_CONNECTION_CHECK_INTERVAL)
+            
+            # Check each device's connection status
+            for device in ble_devices:
+                if device.client is not None:
+                    # Check if disconnected
+                    device_key = f"{device.idx}_{device.name}"
+                    if not device.client.is_connected and device.connected:
+                        print(f"Detected disconnection of {device.name} (idx: {device.idx})")
+                        device.connected = False
+                        
+                        # Only start reconnection if not already trying to reconnect this device
+                        if device_key not in ble_reconnecting_devices:
+                            ble_reconnecting_devices[device_key] = True
+                            
+                            # Start reconnection in a background thread
+                            threading.Thread(
+                                target=lambda idx=device.idx: handle_device_reconnection(idx), 
+                                daemon=True
+                            ).start()
+        except Exception as e:
+            print(f"Error in BLE connection monitor: {str(e)}")
+    
+    print("BLE connection monitor thread stopped")
+
+def handle_device_reconnection(device_idx):
+    """Handle reconnection with automatic retries and backoff"""
+    global ble_devices, ble_reconnecting_devices
+    
+    if device_idx < 0 or device_idx >= len(ble_devices):
+        print(f"Invalid device index: {device_idx}")
+        return
+    
+    device = ble_devices[device_idx]
+    device_key = f"{device_idx}_{device.name}"
+    
+    # Reset reconnection attempts to ensure we get a fresh start
+    device.reconnect_attempts = 0
+    
+    # Try to reconnect with exponential backoff
+    success = False
+    current_delay = BLE_RECONNECT_DELAY
+    
+    while not success and device.reconnect_attempts < BLE_RECONNECT_ATTEMPTS:
+        try:
+            print(f"Attempting to reconnect to {device.name} (idx: {device_idx})...")
+            
+            # Run the reconnection in an async context
+            success = asyncio.run(reconnect_ble_device(device_idx))
+            
+            if success:
+                print(f"Successfully reconnected to {device.name}")
+                break
+            
+            # If we get here, reconnection failed but didn't raise an exception
+            # Calculate next delay with exponential backoff (max 30 seconds)
+            current_delay = min(current_delay * 1.5, BLE_RECONNECT_MAX_DELAY)
+            print(f"Reconnection attempt {device.reconnect_attempts}/{BLE_RECONNECT_ATTEMPTS} failed. " +
+                  f"Retrying in {current_delay:.1f} seconds...")
+            
+            # Wait before next attempt
+            time.sleep(current_delay)
+            
+        except Exception as e:
+            print(f"Error during reconnection of {device.name}: {str(e)}")
+            device.reconnect_attempts += 1
+            
+            # Calculate next delay with exponential backoff
+            current_delay = min(current_delay * 1.5, BLE_RECONNECT_MAX_DELAY)
+            print(f"Reconnection attempt {device.reconnect_attempts}/{BLE_RECONNECT_ATTEMPTS} failed with error. " +
+                  f"Retrying in {current_delay:.1f} seconds...")
+            
+            # Wait before next attempt
+            time.sleep(current_delay)
+    
+    # Remove from reconnecting devices list
+    if device_key in ble_reconnecting_devices:
+        del ble_reconnecting_devices[device_key]
+    
+    if not success:
+        print(f"All reconnection attempts for {device.name} failed after {device.reconnect_attempts} tries")
+
+def stop_ble_connection_monitor():
+    """Stop the BLE connection monitor thread"""
+    global ble_connection_monitor, ble_monitor_stop_event
+    
+    if ble_connection_monitor is not None and ble_connection_monitor.is_alive():
+        ble_monitor_stop_event.set()
+        ble_connection_monitor.join(timeout=2.0)
+        print("BLE connection monitor stopped")
+
+async def reconnect_ble_device(device_idx):
+    """Reconnect to a specific BLE device by index"""
+    global ble_devices, ble_main_event_loop, ble_reconnection_lock
+    
+    # Use a lock to prevent multiple simultaneous reconnection attempts to the same device
+    with ble_reconnection_lock:
+        if device_idx < 0 or device_idx >= len(ble_devices):
+            print(f"Invalid device index: {device_idx}")
+            return False
+        
+        device = ble_devices[device_idx]
+        
+        # Set the event loop for reconnection to be the main event loop
+        if ble_main_event_loop and ble_main_event_loop.is_running():
+            # This reconnection is happening in a new thread, so we need to run it in the main loop
+            future = asyncio.run_coroutine_threadsafe(device.reconnect(), ble_main_event_loop)
+            try:
+                success = future.result(timeout=10.0)  # Wait for up to 10 seconds
+            except Exception as e:
+                print(f"Error in reconnection: {str(e)}")
+                success = False
+        else:
+            # Fallback if main loop isn't available
+            success = await device.reconnect()
+        
+        return success
 
 class BLEDevice:
     """Class for handling BLE device connections (from test.py)"""
-    def __init__(self, address, name, idx):
+    def __init__(self, address, name, idx, event_loop=None):
         self.address = address
         self.name = name
         self.idx = idx
         self.client = None
         self.data_buffer = []
         self.raw_buffer = []
+        self.connected = False
+        self.reconnect_attempts = 0
+        self.last_disconnect_time = 0
+        self.event_loop = event_loop or asyncio.get_event_loop()
+        self.is_reconnecting = False
     
     async def notification_handler(self, sender, data):
         """Handle incoming notifications from this device"""
@@ -686,8 +841,9 @@ class BLEDevice:
         """Connect to this BLE device"""
         print(f"Connecting to {self.name}...")
         
-        self.client = BleakClient(self.address)
         try:
+            # Initialize client with explicit loop argument
+            self.client = BleakClient(self.address, loop=self.event_loop)
             await self.client.connect()
             
             # Subscribe to notifications with this device's handler
@@ -704,17 +860,86 @@ class BLEDevice:
             await self.client.write_gatt_char(UUID_X, start_command)
             
             print(f"{self.name} connected and started.")
+            self.connected = True
+            self.reconnect_attempts = 0
             return True
         
         except Exception as e:
             print(f"Failed to connect to {self.name}: {str(e)}")
+            self.connected = False
+            return False
+    
+    async def reconnect(self):
+        """Reconnect to this BLE device with backoff strategy"""
+        if self.reconnect_attempts >= BLE_RECONNECT_ATTEMPTS:
+            print(f"Maximum reconnect attempts ({BLE_RECONNECT_ATTEMPTS}) reached for {self.name}")
+            return False
+        
+        # Check if we need to enforce a delay between reconnection attempts
+        current_time = time.time()
+        if current_time - self.last_disconnect_time < BLE_RECONNECT_DELAY:
+            delay = BLE_RECONNECT_DELAY - (current_time - self.last_disconnect_time)
+            print(f"Waiting {delay:.1f}s before reconnecting to {self.name}")
+            await asyncio.sleep(delay)
+        
+        self.reconnect_attempts += 1
+        print(f"Reconnection attempt {self.reconnect_attempts}/{BLE_RECONNECT_ATTEMPTS} for {self.name}")
+        
+        # Set reconnecting flag
+        self.is_reconnecting = True
+        
+        # Clean up any existing client
+        if self.client:
+            try:
+                # Only attempt disconnect if it thinks it's connected
+                if self.client.is_connected:
+                    await self.client.disconnect()
+            except Exception as e:
+                print(f"Error disconnecting during reconnect: {str(e)}")
+            self.client = None
+        
+        try:
+            # Create a new client with the same event loop
+            self.client = BleakClient(self.address, loop=self.event_loop)
+            
+            # Connect to the device
+            await self.client.connect(timeout=10.0)  # Add explicit timeout for connection
+            
+            # Subscribe to notifications with this device's handler
+            await self.client.start_notify(UUID_A, self.notification_handler)
+            print(f"Resubscribed to notifications for device {self.idx} ({self.name})")
+            
+            # Send time and start command
+            time_bytes = self.clock_in()
+            command_time = bytearray([1, 0]) + time_bytes
+            await self.client.write_gatt_char(UUID_X, command_time)
+            
+            # Start device command
+            start_command = bytearray([0, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+            await self.client.write_gatt_char(UUID_X, start_command)
+            
+            print(f"{self.name} reconnected successfully after {self.reconnect_attempts} attempts")
+            self.connected = True
+            self.is_reconnecting = False
+            return True
+            
+        except Exception as e:
+            print(f"Failed to reconnect to {self.name} (attempt {self.reconnect_attempts}): {str(e)}")
+            self.connected = False
+            self.last_disconnect_time = time.time()  # Update time for backoff
+            self.is_reconnecting = False
             return False
     
     async def disconnect(self):
         """Disconnect from this BLE device"""
         if self.client and self.client.is_connected:
-            await self.client.disconnect()
-            print(f"{self.name} disconnected.")
+            try:
+                await self.client.disconnect()
+                print(f"{self.name} disconnected.")
+                self.connected = False
+                self.last_disconnect_time = time.time()
+            except Exception as e:
+                print(f"Error disconnecting from {self.name}: {str(e)}")
     
     def bytes_to_double(self, bytes_data):
         """Convert two bytes of data into a signed integer"""
@@ -1138,6 +1363,9 @@ def cleanup_sensor_system():
     # Stop the file batch writer
     stop_file_batch_writer()
     
+    # Stop BLE connection monitor
+    stop_ble_connection_monitor()
+    
     # Stop EmotiBit OSC server if running
     setup_emotibit_osc(enable=False)
     
@@ -1145,7 +1373,13 @@ def cleanup_sensor_system():
     for device in ble_devices:
         if hasattr(device, 'client') and device.client and device.client.is_connected:
             try:
-                asyncio.get_event_loop().run_until_complete(device.disconnect())
+                # Use the device's event loop for clean disconnection
+                if hasattr(device, 'event_loop') and device.event_loop and device.event_loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(device.disconnect(), device.event_loop)
+                    future.result(timeout=5.0)
+                else:
+                    # Fallback to default loop if device loop isn't available
+                    asyncio.get_event_loop().run_until_complete(device.disconnect())
             except:
                 pass
     
