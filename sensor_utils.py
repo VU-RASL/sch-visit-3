@@ -861,7 +861,8 @@ def run_ml_prediction(participant_data):
         "BLE_IMU_1": "NodeB8C6E1",
         "BLE_IMU_2": "NodeB8C6E2",
         "BLE_IMU_3": "NodeB8C6F6",
-        "BLE_IMU_4": "NodeB8C6FD"
+        "BLE_IMU_4": "NodeB8C6FD", 
+        "BLE_IMU_5": "NodeB8C6FF"
     }
     
     # Map quaternion components to expected feature naming
