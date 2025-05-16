@@ -67,9 +67,6 @@ class SessionPage(tk.Frame):
         
         # Create widgets
         self.create_widgets()
-        
-        # Start ML prediction updates
-        self.update_ml_prediction()
     
     def create_widgets(self):
         # Main container with padding
@@ -414,27 +411,13 @@ class SessionPage(tk.Frame):
             
             self.start_sr_timer(time=30)
     
-    def update_ml_prediction(self):
-        """Update ML prediction display with simulated data"""
-        if self.ml_prediction_active:
-            # Generate random prediction every second
-            current_time = time.time()
-            if current_time - self.last_prediction_time >= 1.0:
-                # Generate random prediction between 0 and 1
-                prediction_value = random.random()
-                self.update_ml_display(prediction_value)
-                self.last_prediction_time = current_time
-        
-        # Schedule next update
-        self.after(100, self.update_ml_prediction)
-    
     def update_ml_display(self, prediction_value, sample_counts=None):
         """Update ML prediction display with the given value and sample counts"""
         if prediction_value is not None:
             threshold = float(self.controller.participant_data.get("ml_threshold", 0.5))
             
             # Update prediction display
-            self.ml_label.config(text=f"Prediction: {'Positive' if prediction_value > threshold else 'Negative'}")
+            self.ml_label.config(text=f"Raw Score: {prediction_value:.3f}, Prediction: {'Positive' if prediction_value > threshold else 'Negative'}")
             
             # If sample counts are provided, display them
             if sample_counts:

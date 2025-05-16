@@ -13,6 +13,13 @@ from audio_utils import process_audio_data
 import threading
 import atexit
 
+import pickle
+import pandas as pd
+import torch
+import torch.nn as nn
+from typing import List, Dict, Tuple, Any, Optional, Union
+from scipy.ndimage import gaussian_filter1d
+
 # Data buffer to store recent sensor data
 sensor_data_buffer = {}
 buffer_max_age = 10  # Maximum age of data to keep in buffer (seconds) - older data will be removed
@@ -48,6 +55,9 @@ ble_reconnecting_devices = {}  # Track devices that are currently in reconnectio
 # File batch worker thread
 file_batch_thread = None
 file_batch_stop_event = threading.Event()
+
+# Machine learning model
+model_loader = None
 
 # Register cleanup function to run at exit
 atexit.register(lambda: cleanup_sensor_system())
@@ -627,17 +637,338 @@ def get_samples():
 
     return recent_data, sample_counts
 
+class EmbeddingNet(nn.Module):
+    """
+    A multi-layer perceptron that embeds input features into a latent space.
+    Replicates the architecture from the original model.
+    """
+
+    def __init__(self, input_dim: int, embedding_dim: int = 64):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.5),
+            nn.Linear(128, embedding_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(x)
+
+
+class DeepPrototypeModelLoader:
+    """
+    Standalone class for loading and using a saved deep prototype model.
+    """
+    
+    def __init__(self, model_dir: str, device: str = "cpu"):
+        """
+        Initialize the model loader by loading all necessary components.
+        
+        Args:
+            model_dir: Directory containing the saved model artifacts
+            device: Device to load the model onto ("cpu" or "cuda")
+        """
+        self.model_dir = model_dir
+        self.device = torch.device(device)
+        
+        # Check if model directory exists
+        if not os.path.exists(model_dir):
+            raise FileNotFoundError(f"Model directory not found: {model_dir}")
+        
+        # Load feature names
+        feature_names_path = os.path.join(model_dir, "feature_names.pkl")
+        if not os.path.exists(feature_names_path):
+            raise FileNotFoundError(f"Feature names file not found: {feature_names_path}")
+        with open(feature_names_path, "rb") as f:
+            self.feature_names = pickle.load(f)
+        
+        # Load scaler
+        scaler_path = os.path.join(model_dir, "scaler.pkl")
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(f"Scaler file not found: {scaler_path}")
+        with open(scaler_path, "rb") as f:
+            self.scaler = pickle.load(f)
+        
+        # Load model configuration
+        config_path = os.path.join(model_dir, "model_config.pkl")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Model config file not found: {config_path}")
+        with open(config_path, "rb") as f:
+            model_config = pickle.load(f)
+        
+        input_dim = model_config["input_dim"]
+        embedding_dim = model_config["embedding_dim"]
+        
+        # Initialize and load model
+        model_path = os.path.join(model_dir, "model.pt")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model weights file not found: {model_path}")
+            
+        self.model = EmbeddingNet(input_dim, embedding_dim).to(self.device)
+        self.model.load_state_dict(torch.load(
+            model_path, 
+            map_location=self.device
+        ))
+        self.model.eval()
+        
+        # Load prototypes
+        prototypes_path = os.path.join(model_dir, "prototypes.pkl")
+        if not os.path.exists(prototypes_path):
+            raise FileNotFoundError(f"Prototypes file not found: {prototypes_path}")
+        with open(prototypes_path, "rb") as f:
+            prototype_dict = pickle.load(f)
+            # Convert numpy arrays back to torch tensors
+            self.prototypes = {k: torch.tensor(v, device=self.device) for k, v in prototype_dict.items()}
+        
+        # Create a mapping for prototype labels
+        self.prototype_labels = ['Negative']
+        for key in self.prototypes.keys():
+            if key != 0:  # 0 is the negative prototype
+                self.prototype_labels.append(str(key))
+    
+    def preprocess_features(self, features_df: pd.DataFrame) -> np.ndarray:
+        """
+        Preprocess the input features using the saved scaler.
+        Ensures all expected features are present, adding zero columns for missing features.
+        
+        Args:
+            features_df: DataFrame containing raw features
+            
+        Returns:
+            Scaled feature array ready for model input
+        """
+        # Create a copy to avoid modifying the original DataFrame
+        features_df = features_df.copy()
+        
+        # Check and add missing features all at once using a dictionary
+        missing_features = {}
+        for feature in self.feature_names:
+            if feature not in features_df.columns:
+                missing_features[feature] = 0
+                
+        # Add all missing columns at once if any
+        if missing_features:
+            for feature, value in missing_features.items():
+                features_df[feature] = value
+        
+        # Keep only needed features and in the right order
+        X = features_df[self.feature_names]
+        
+        # Scale the features
+        X_scaled = self.scaler.transform(X)
+        return X_scaled
+    
+    def predict(self, features_df: pd.DataFrame, smoothing_sigma: float = 2.0) -> pd.DataFrame:
+        """
+        Generate predictions for input features.
+        
+        Args:
+            features_df: DataFrame containing features for prediction
+            smoothing_sigma: Sigma parameter for Gaussian smoothing of probabilities
+            
+        Returns:
+            DataFrame with prediction results
+        """
+        # Preprocess features
+        X_scaled = self.preprocess_features(features_df)
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(self.device)
+        
+        # Get timestamps if available, otherwise create index-based timestamps
+        if "timestamp" in features_df.columns:
+            timestamps = features_df["timestamp"].values
+        else:
+            timestamps = np.arange(len(features_df))
+        
+        # Generate embeddings
+        with torch.no_grad():
+            embeddings = self.model(X_tensor)
+        
+        # Prepare prototype tensors for distance calculation
+        all_prototype_tensors = []
+        prototype_labels = []
+        
+        # Add the negative prototype first
+        all_prototype_tensors.append(self.prototypes[0].unsqueeze(0))
+        prototype_labels.append('Negative')
+        
+        # Add all positive prototypes
+        for category, proto in self.prototypes.items():
+            if category != 0:
+                all_prototype_tensors.append(proto.unsqueeze(0))
+                prototype_labels.append(str(category))
+        
+        # Stack all prototypes
+        all_prototypes_stacked = torch.cat(all_prototype_tensors, dim=0)
+        
+        # Compute distances to all prototypes
+        dists = torch.cdist(embeddings, all_prototypes_stacked, p=2) ** 2
+        
+        # Apply softmax to get probabilities across all prototypes
+        probs = nn.functional.softmax(-dists, dim=1)
+        
+        # Sum probabilities of all positive prototypes (all except 'Negative' which is at index 0)
+        prob_positive = 1 - probs[:, 0].cpu().numpy()
+        
+        # Apply Gaussian smoothing if requested
+        if smoothing_sigma > 0:
+            prob_positive = gaussian_filter1d(prob_positive, sigma=smoothing_sigma)
+        
+        # Get the most likely prototype for each embedding
+        most_likely_prototype_idx = torch.argmin(dists, dim=1).cpu().numpy()
+        most_likely_prototype = [prototype_labels[idx] for idx in most_likely_prototype_idx]
+        
+        # Get the most likely POSITIVE prototype (ignoring the negative prototype)
+        # First, create a version of distances with the negative prototype set to infinity
+        positive_only_dists = dists.clone()
+        positive_only_dists[:, 0] = float('inf')  # Set distance to negative prototype to infinity
+        
+        # Now find the most likely positive prototype
+        most_likely_positive_idx = torch.argmin(positive_only_dists, dim=1).cpu().numpy()
+        most_likely_positive = [prototype_labels[idx] for idx in most_likely_positive_idx]
+        
+        # Get the probability of the most likely positive prototype
+        most_likely_positive_prob = probs.gather(1, torch.tensor(most_likely_positive_idx, device=self.device).unsqueeze(1)).squeeze().cpu().numpy()
+        
+        # Create predictions DataFrame
+        predictions = pd.DataFrame({
+            "timestamp": timestamps,
+            "prob_positive": prob_positive,
+            "most_likely_prototype": most_likely_prototype,
+            "most_likely_positive": most_likely_positive,
+            "most_likely_positive_prob": most_likely_positive_prob,
+            "is_positive": (most_likely_prototype_idx != 0).astype(int)
+        })
+        
+        return predictions
+
 def run_ml_prediction(participant_data):
     """Run machine learning prediction on sensor data"""
+
+    global model_loader
+    if model_loader is None:
+        models_base_dir = "models"
+        available_models = os.listdir(models_base_dir)
+        model_loader = DeepPrototypeModelLoader(model_dir="models/")
+
     # Get the last 5 seconds of sensor data
     recent_data, sample_counts = get_samples()
     
-    # For now, just generate a random prediction as placeholder
-    threshold = float(participant_data.get("ml_threshold", 0.5))
-    prediction = random.random()
+    # Create mapping from sensor IDs to expected node names
+    # This maps each BLE IMU device to the corresponding Wing node name
+    node_mapping = {
+        "BLE_IMU_1": "NodeB8C6E1",
+        "BLE_IMU_2": "NodeB8C6E2",
+        "BLE_IMU_3": "NodeB8C6F6",
+        "BLE_IMU_4": "NodeB8C6FD"
+    }
+    
+    # Map quaternion components to expected feature naming
+    component_mapping = {
+        "qw": "W",
+        "qx": "X",
+        "qy": "Y",
+        "qz": "Z"
+    }
+    
+    # Initialize feature dictionary with a single timestamp
+    feature_dict = {"timestamp": [time.time()]}
+    
+    # Initialize all features to 0.0 to handle missing data
+    for feature in model_loader.feature_names:
+        feature_dict[feature] = [0.0]
+    
+    # Calculate statistics for each IMU sensor and map to feature dict
+    if sample_counts["imu_samples"] > 0:
+        for sensor_id, sensor_data in recent_data["imu_sensors"].items():
+            # Extract the node name from the sensor ID
+            node_name = None
+            for ble_id, node in node_mapping.items():
+                if ble_id in sensor_id:
+                    node_name = node
+                    break
+            
+            if node_name is None:
+                continue  # Skip if we can't map this sensor
+            
+            # Get quaternion values (qw, qx, qy, qz are at indices 0, 1, 2, 3 in the data format)
+            quat_data = np.array([data_point[:4] for data_point in sensor_data["data"]])
+            
+            # Only calculate if we have enough data points
+            if len(quat_data) > 0:
+                component_names = ["qw", "qx", "qy", "qz"]
+                
+                # Calculate statistics for each quaternion component
+                for i, comp_name in enumerate(component_names):
+                    values = quat_data[:, i]
+                    
+                    # Skip if not enough values
+                    if len(values) < 2:
+                        continue
+                    
+                    # Map component name to expected format
+                    comp_mapped = component_mapping[comp_name]
+                    
+                    # Basic statistics
+                    mean_val = float(np.mean(values))
+                    min_val = float(np.min(values))
+                    max_val = float(np.max(values))
+                    std_val = float(np.std(values))
+                    
+                    # Calculate rolling statistics (window of 3 samples or 1/3 of data points, whichever is larger)
+                    window_size = max(3, len(values) // 3)
+                    if len(values) >= window_size:
+                        rolling_mean = np.mean(values[-window_size:])
+                        rolling_std = np.std(values[-window_size:])
+                    else:
+                        rolling_mean = mean_val
+                        rolling_std = std_val
+                    
+                    # Calculate trend (slope of linear regression)
+                    x = np.arange(len(values))
+                    A = np.vstack([x, np.ones(len(x))]).T
+                    slope, _ = np.linalg.lstsq(A, values, rcond=None)[0]
+                    trend = float(slope)
+                    
+                    # Construct feature names
+                    feature_prefix = f"Wing_{node_name}_0000_{comp_mapped}"
+                    
+                    # Store values in feature_dict (just one value per feature)
+                    for stat, value in [
+                        ("mean", mean_val),
+                        ("min", min_val),
+                        ("max", max_val),
+                        ("std", std_val),
+                        ("rolling_mean", rolling_mean),
+                        ("rolling_std", rolling_std),
+                        ("trend", trend)
+                    ]:
+                        feature_name = f"{feature_prefix}_{stat}"
+                        if feature_name in feature_dict:
+                            # Set single value
+                            feature_dict[feature_name] = [value]
+    
+    # Create DataFrame with features
+    example_features = pd.DataFrame(feature_dict)
+    
+    # Generate predictions
+    predictions = model_loader.predict(example_features)
+    print("\nModel predictions:")
+    print(predictions['prob_positive'])
+    
+    # # Print OSC signal names
+    # if sample_counts["osc_samples"] > 0:
+    #     print("\nOSC Signals:")
+    #     for signal_name in sample_counts["osc_samples_by_signal"]:
+    #         print(f"  - {signal_name}")
+    
+    # # Print Audio sensor count if any
+    # if sample_counts["audio_samples"] > 0:
+    #     print(f"\nAudio Sensors: {sample_counts['audio_samples']} samples")
     
     # Return both the prediction and sample counts
-    return prediction, sample_counts
+    return predictions['prob_positive'].values[0], sample_counts
 
 # BLE connection utilities from test.py
 async def connect_ble_sensors():

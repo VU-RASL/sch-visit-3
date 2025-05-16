@@ -147,9 +147,9 @@ class IISCAApp(tk.Tk):
                     data_item = self.data_queue.get()
                     sensor_utils.process_sensor_data(data_item, self.data_dir, self.current_session, self.session_types)
                 
-                # Run ML prediction every 5 seconds for non-Standard sessions
+                # Run ML prediction every n seconds for non-Standard sessions
                 current_time = time.time()
-                if (current_time - last_ml_run_time >= 5.0 and
+                if (current_time - last_ml_run_time >= 1 and
                     self.current_session < len(self.session_types)):
                     
                     # Generate prediction and get sample counts using the sensor_utils module
