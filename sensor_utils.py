@@ -22,7 +22,7 @@ from scipy.ndimage import gaussian_filter1d
 
 # Data buffer to store recent sensor data
 sensor_data_buffer = {}
-buffer_max_age = 10  # Maximum age of data to keep in buffer (seconds) - older data will be removed
+buffer_max_age = 40  # Maximum age of data to keep in buffer (seconds) - older data will be removed
 
 # Batching system for file I/O operations
 file_write_batches = {}
@@ -581,9 +581,10 @@ def print_emotibit_ppg_ir(recent_data):
         return None
 
 def get_samples():
+
     """Get the last N seconds of sensor data for all sensors"""
-    # Get recent sensor data
-    recent_data = get_recent_sensor_data(seconds=5)
+    requested_seconds = 30
+    recent_data = get_recent_sensor_data(seconds=requested_seconds)
 
     # Count samples for each sensor type
     imu_sample_count = 0
@@ -627,7 +628,16 @@ def get_samples():
     print(f"Total IMU samples: {imu_sample_count}")
     print("IMU samples by device:")
     for device, count in imu_samples_by_device.items():
-        print(f"  {device}: {count} samples")
+        # Get actual device name from ble_devices list
+        actual_device_name = "Unknown"
+        device_idx = device.split("_")[-1]
+        if device_idx.isdigit():
+            for ble_device in ble_devices:
+                if ble_device.idx == int(device_idx) - 1:  # Convert from 1-based to 0-based indexing
+                    actual_device_name = ble_device.name
+                    break
+                
+        print(f"  {device} ({actual_device_name}): {count} samples")
     print(f"Total OSC samples: {osc_sample_count}")
     print("OSC samples by signal:")
     for signal, count in osc_samples_by_signal.items():
@@ -855,16 +865,6 @@ def run_ml_prediction(participant_data):
     # Get the last 5 seconds of sensor data
     recent_data, sample_counts = get_samples()
     
-    # Create mapping from sensor IDs to expected node names
-    # This maps each BLE IMU device to the corresponding Wing node name
-    node_mapping = {
-        "BLE_IMU_1": "NodeB8C6E1",
-        "BLE_IMU_2": "NodeB8C6E2",
-        "BLE_IMU_3": "NodeB8C6F6",
-        "BLE_IMU_4": "NodeB8C6FD", 
-        "BLE_IMU_5": "NodeB8C6FF"
-    }
-    
     # Map quaternion components to expected feature naming
     component_mapping = {
         "qw": "W",
@@ -884,14 +884,17 @@ def run_ml_prediction(participant_data):
     if sample_counts["imu_samples"] > 0:
         for sensor_id, sensor_data in recent_data["imu_sensors"].items():
             # Extract the node name from the sensor ID
+            device_idx = sensor_id.split("_")[-1]
             node_name = None
-            for ble_id, node in node_mapping.items():
-                if ble_id in sensor_id:
-                    node_name = node
-                    break
+            if device_idx.isdigit():
+                for device in ble_devices:
+                    if device.idx == int(device_idx) - 1:  # Convert from 1-based to 0-based indexing
+                        node_name = device.name
+                        break
             
             if node_name is None:
-                continue  # Skip if we can't map this sensor
+                print(f"Could not find device name for {sensor_id}, skipping")
+                continue  # Skip if we can't find the device name
             
             # Get quaternion values (qw, qx, qy, qz are at indices 0, 1, 2, 3 in the data format)
             quat_data = np.array([data_point[:4] for data_point in sensor_data["data"]])
@@ -956,17 +959,59 @@ def run_ml_prediction(participant_data):
     # Generate predictions
     predictions = model_loader.predict(example_features)
     print("\nModel predictions:")
-    print(predictions['prob_positive'])
+    print(predictions)
+
+    # Write predictions to file - use the same data_dir as other sensor files
+    current_time = time.time()
     
-    # # Print OSC signal names
-    # if sample_counts["osc_samples"] > 0:
-    #     print("\nOSC Signals:")
-    #     for signal_name in sample_counts["osc_samples_by_signal"]:
-    #         print(f"  - {signal_name}")
+    # Look for an existing data directory in file_write_batches
+    data_dir = None
+    with file_batch_lock:
+        # Find the first active data directory from existing batch files
+        for file_key in file_write_batches.keys():
+            if file_key and isinstance(file_key, tuple) and len(file_key) > 0:
+                data_dir = file_key[0]
+                if data_dir and not data_dir.startswith("data/"):
+                    # Found a valid data directory
+                    break
     
-    # # Print Audio sensor count if any
-    # if sample_counts["audio_samples"] > 0:
-    #     print(f"\nAudio Sensors: {sample_counts['audio_samples']} samples")
+    # If no data directory found in batches, try participant_data
+    if not data_dir and participant_data and "data_dir" in participant_data and participant_data["data_dir"]:
+        data_dir = participant_data["data_dir"]
+    
+    # If still no data directory, use fallback
+    if not data_dir:
+        data_dir = os.path.join("data", datetime.datetime.now().strftime("%Y-%m-%d"))
+    
+    filename = "ML_Predictions.csv"
+    file_key = (data_dir, filename)
+    
+    # Prepare prediction data for writing
+    prediction_data = {
+        "timestamp": current_time,
+        "prob_positive": predictions['prob_positive'].values[0]
+    }
+    
+    # Format as CSV line
+    formatted_timestamp = f"{prediction_data['timestamp']:.3f}"
+    line = f"{formatted_timestamp},{prediction_data['prob_positive']:.4f}\n"
+    
+    with file_batch_lock:
+        # Initialize batch if it doesn't exist
+        if file_key not in file_write_batches:
+            file_write_batches[file_key] = {
+                "data": [],
+                "header": "timestamp,prob_positive",
+                "last_update": time.time()
+            }
+        
+        # Add line to batch
+        file_write_batches[file_key]["data"].append(line)
+        file_write_batches[file_key]["last_update"] = time.time()
+        
+        # Write immediately if batch is full
+        if len(file_write_batches[file_key]["data"]) >= FILE_BATCH_SIZE:
+            write_batch_to_file(file_key)
     
     # Return both the prediction and sample counts
     return predictions['prob_positive'].values[0], sample_counts
