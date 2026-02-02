@@ -6,6 +6,7 @@ import sensor_utils
 from audio_utils import AudioProcessor
 import os
 import datetime
+import logging
 
 class SensorPage(tk.Frame):
     def __init__(self, parent, controller):
@@ -150,27 +151,30 @@ class SensorPage(tk.Frame):
             progress_text = scrolledtext.ScrolledText(progress_window, height=8, width=50)
             progress_text.pack(pady=10, padx=15, fill="both", expand=True)
             
-            # Create a custom print function that updates the text widget
-            def update_progress_text(message):
-                self.after(0, lambda: progress_text.insert(tk.END, message + "\n"))
-                self.after(0, lambda: progress_text.see(tk.END))  # Auto-scroll to the end
-            
-            # Override print function for sensor_utils
-            original_print = print
-            def custom_print(*args, **kwargs):
-                message = " ".join(map(str, args))
-                update_progress_text(message)
-                original_print(*args, **kwargs)  # Still print to console
-            
-            # Patch the print function in sensor_utils module
-            import builtins
-            builtins.print = custom_print
+            # Attach a logging handler to stream sensor_utils logs into the progress_text
+            class _ProgressTextHandler(logging.Handler):
+                def __init__(self, ui_self, text_widget):
+                    super().__init__()
+                    self.ui_self = ui_self
+                    self.text_widget = text_widget
+                def emit(self, record):
+                    msg = self.format(record)
+                    # Ensure UI update happens on main thread
+                    try:
+                        self.ui_self.after(0, lambda: self.text_widget.insert(tk.END, msg + "\n"))
+                        self.ui_self.after(0, lambda: self.text_widget.see(tk.END))
+                    except Exception:
+                        pass
+            sensor_logger = logging.getLogger("sensor_utils")
+            handler = _ProgressTextHandler(self, progress_text)
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            sensor_logger.addHandler(handler)
             
             # Connect to BLE sensors
             connected_devices = loop.run_until_complete(sensor_utils.connect_ble_sensors())
-            
-            # Restore original print function
-            builtins.print = original_print
+            # Remove handler after use
+            sensor_logger.removeHandler(handler)
             
             # Update UI with connected devices
             for i, device in enumerate(connected_devices):
@@ -214,6 +218,14 @@ class SensorPage(tk.Frame):
             
         except Exception as e:
             # Handle any errors
+            try:
+                # Attempt to remove handler if it exists
+                sensor_logger = logging.getLogger("sensor_utils")
+                for h in list(sensor_logger.handlers):
+                    if isinstance(h, logging.Handler) and getattr(h, "ui_self", None) is self:
+                        sensor_logger.removeHandler(h)
+            except Exception:
+                pass
             self.after(0, lambda: messagebox.showerror("Connection Error", f"Failed to connect to BLE sensors: {str(e)}"))
             self.after(0, progress_window.destroy)
             self.after(0, lambda: self.connect_button.config(state="normal", text="Connect & Start"))

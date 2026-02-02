@@ -5,8 +5,6 @@ import random
 import time
 from PIL import Image, ImageTk
 import os
-import requests
-import json
 from datetime import datetime
 
 class NonBlockingPopup(tk.Toplevel):
@@ -64,6 +62,10 @@ class SessionPage(tk.Frame):
         self.trial_count = 0  # Track number of trials (SR to EO transitions)
         self.eo_time = 0  # Add this line to track EO timer
         self.timer_id = None  # Add timer ID to track scheduled timers
+        # Cache last displayed texts to avoid unnecessary UI updates (reduce flicker)
+        self._last_ml_label_text = None
+        self._last_ml_prob_text = None
+        self._last_ml_counts_text = None
         
         # Create widgets
         self.create_widgets()
@@ -98,6 +100,8 @@ class SessionPage(tk.Frame):
         self.timer_label = ttk.Label(self.timer_frame, text="SR Timer: 00:00", font=("Helvetica", 28))
         self.timer_label.pack()
         
+        # Create a 'Start 30s Timer' button (initially visible; enabled per session)
+        # Place it under the timer label
         # Control buttons with improved layout
         control_frame = ttk.LabelFrame(main_container, text="Session Controls")
         control_frame.pack(pady=15, padx=10, fill="x")
@@ -108,6 +112,15 @@ class SessionPage(tk.Frame):
         
         # Create a more modern button style
         button_style = {"width": 14, "padding": 8}
+        
+        # Now that style is defined, create the Start 30s Timer button in the timer area
+        self.start_30s_button = ttk.Button(
+            self.timer_frame,
+            text="Start 30s Timer",
+            command=self.start_sr_30s,
+            **button_style
+        )
+        self.start_30s_button.pack(pady=8)
         
         # First row of buttons
         button_row1 = ttk.Frame(self.standard_frame)
@@ -146,11 +159,36 @@ class SessionPage(tk.Frame):
         ml_inner_frame = ttk.Frame(self.ml_frame)
         ml_inner_frame.pack(pady=10, fill="x")
         
-        self.ml_label = ttk.Label(ml_inner_frame, text="No prediction yet", font=("Helvetica", 12))
-        self.ml_label.pack(pady=5)
+        # Large, stable header for closest prototype (centered)
+        self.ml_label = ttk.Label(
+            ml_inner_frame,
+            text="Closest Prototype: N/A",
+            font=("Helvetica", 16, "bold"),
+            justify="center",
+            anchor="center"
+        )
+        self.ml_label.pack(pady=5, fill="x")
         
-        self.ml_probability = ttk.Label(ml_inner_frame, text="Probability: 0.000", font=("Helvetica", 12))
-        self.ml_probability.pack(pady=5)
+        # Monospace, fixed-width distances label to reduce layout changes (centered)
+        self.ml_probability = ttk.Label(
+            ml_inner_frame,
+            text="",
+            font=("Courier New", 12),
+            justify="center",
+            anchor="center",
+            width=60
+        )
+        self.ml_probability.pack(pady=5, fill="x", expand=True)
+        
+        # Separate counts line to avoid changing the distances block each update (centered)
+        self.ml_counts = ttk.Label(
+            ml_inner_frame,
+            text="",
+            font=("Helvetica", 11),
+            anchor="center",
+            justify="center"
+        )
+        self.ml_counts.pack(pady=2, fill="x")
         
         self.ml_progress = ttk.Progressbar(ml_inner_frame, orient="horizontal", length=300, mode="determinate")
         self.ml_progress.pack(pady=5)
@@ -303,6 +341,9 @@ class SessionPage(tk.Frame):
                 "notes": notes,
                 "trials": self.trial_count
             }
+            # Persist session data immediately to avoid loss on crash
+            if hasattr(self.controller, "save_session_data"):
+                self.controller.save_session_data()
             
             # Move to next session
             self.controller.current_session += 1
@@ -381,6 +422,18 @@ class SessionPage(tk.Frame):
             self.title_label.config(text=f"Session {self.controller.current_session + 1} of {len(self.controller.session_types)}")
             self.session_label.config(text=f"Session Type: {session_type}")
             
+            # If this session hasn't been recorded yet, create and save it at session begin
+            session_key = str(self.controller.current_session)
+            if session_key not in self.controller.session_data:
+                self.controller.session_data[session_key] = {
+                    "type": session_type,
+                    "notes": "",
+                    "trials": 0,
+                    "started_at": datetime.now().isoformat()
+                }
+                if hasattr(self.controller, "save_session_data"):
+                    self.controller.save_session_data()
+
             # Reset state
             self.current_state = "SR"
             self.state_label.config(text="Current State: SR")
@@ -409,62 +462,70 @@ class SessionPage(tk.Frame):
             self.eo_button.config(state="normal")
             self.sr_button.config(state="disabled")
             
-            self.start_sr_timer(time=30)
+            # Do not auto-start SR timer; show enable button for manual start
+            if hasattr(self, "start_30s_button"):
+                self.start_30s_button.config(state="normal")
     
-    def update_ml_display(self, prediction_value, sample_counts=None):
-        """Update ML prediction display with the given value and sample counts"""
-        if prediction_value is not None:
-            threshold = float(self.controller.participant_data.get("ml_threshold", 0.5))
-            
-            # Update prediction display
-            self.ml_label.config(text=f"Raw Score: {prediction_value:.3f}, Prediction: {'Positive' if prediction_value > threshold else 'Negative'}")
-            
-            # If sample counts are provided, display them
-            if sample_counts:
-                self.ml_probability.config(
-                    text=f"Samples: IMU={sample_counts['imu_samples']}, "
-                         f"OSC={sample_counts['osc_samples']}, "
-                         f"Audio={sample_counts['audio_samples']}"
-                )
+    def update_ml_display(self, distances, sample_counts=None):
+        """Update ML display to show closest prototype (large) and distances list without flicker."""
+        try:
+            if isinstance(distances, dict) and distances:
+                # Sort by increasing distance for readability
+                sorted_items = sorted(distances.items(), key=lambda kv: kv[1])
+                lines = [f"{k}: {v:.3f}" for k, v in sorted_items]
+                # Closest prototype overall (first after sorting)
+                closest_label, closest_dist = sorted_items[0]
+                closest_text = f"Closest Prototype: {closest_label} ({closest_dist:.3f})"
+                distances_text = "\n".join(lines)
+                # Only update labels if content changed (prevents flicker)
+                if closest_text != self._last_ml_label_text:
+                    self.ml_label.config(text=closest_text)
+                    self._last_ml_label_text = closest_text
+                if distances_text != self._last_ml_prob_text:
+                    self.ml_probability.config(text=distances_text)
+                    self._last_ml_prob_text = distances_text
             else:
-                self.ml_probability.config(text=f"Probability: {prediction_value:.3f}")
+                if "Closest Prototype: N/A" != self._last_ml_label_text:
+                    self.ml_label.config(text="Closest Prototype: N/A")
+                    self._last_ml_label_text = "Closest Prototype: N/A"
+                if "No distances available" != self._last_ml_prob_text:
+                    self.ml_probability.config(text="No distances available")
+                    self._last_ml_prob_text = "No distances available"
             
-            # Update progress bar
-            self.ml_progress["value"] = prediction_value * 100
+            # We no longer use the progress bar for raw score
+            self.ml_progress["value"] = 0
             
-            # Store the last prediction value
-            self.last_prediction_value = prediction_value
-            
-            # Enable next button if prediction exceeds threshold
-            if prediction_value > threshold:
-                self.next_button.config(state="normal")
+            # Sample counts (optional) - update separately to avoid touching distances label
+            if sample_counts:
+                counts_text = (f"Samples: IMU={sample_counts.get('imu_samples',0)}, "
+                               f"OSC={sample_counts.get('osc_samples',0)}, "
+                               f"Audio={sample_counts.get('audio_samples',0)}")
+                if counts_text != self._last_ml_counts_text:
+                    self.ml_counts.config(text=counts_text)
+                    self._last_ml_counts_text = counts_text
+            else:
+                if "" != self._last_ml_counts_text:
+                    self.ml_counts.config(text="")
+                    self._last_ml_counts_text = ""
+        except Exception:
+            # Fail-soft to avoid UI crashes
+            if "Prototype distances" != self._last_ml_label_text:
+                self.ml_label.config(text="Prototype distances")
+                self._last_ml_label_text = "Prototype distances"
+            if "Error displaying distances" != self._last_ml_prob_text:
+                self.ml_probability.config(text="Error displaying distances")
+                self._last_ml_prob_text = "Error displaying distances"
     
     def show_notification(self, message):
         """Show a notification to the participant"""
         NonBlockingPopup(self, "Notification", message)
-        
-        # Update Firebase database
-        try:
-            # Format data to send to Firebase
-            data = {
-                'notification_type': message,
-                'timestamp': datetime.now().isoformat(),
-                'session_type': self.controller.session_types[self.controller.current_session] if self.controller.current_session < len(self.controller.session_types) else "Unknown",
-                'current_state': self.current_state
-            }
-            
-            # Firebase database URL
-            firebase_url = "https://visit3-8c2c0-default-rtdb.europe-west1.firebasedatabase.app/notifications.json"
-            
-            # Send POST request to Firebase (creates a new entry with an auto-generated ID)
-            response = requests.post(firebase_url, data=json.dumps(data))
-            
-            if response.status_code == 200:
-                print(f"Notification sent to Firebase: {message}")
-            else:
-                print(f"Failed to send notification to Firebase. Status code: {response.status_code}")
-        except Exception as e:
-            print(f"Error updating Firebase database: {str(e)}")
+
+    def start_sr_30s(self):
+        """Manually start a 30-second SR timer from the button."""
+        # Disable the button to prevent multiple starts
+        if hasattr(self, "start_30s_button"):
+            self.start_30s_button.config(state="disabled")
+        self.start_sr_timer(time=30)
 
     def start_eo_timer(self):
         """Start the EO timer"""

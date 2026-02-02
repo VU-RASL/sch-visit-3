@@ -5,15 +5,17 @@ import os
 import datetime
 import threading
 import time
-import random
 import json
 import math
 import sv_ttk  # Modern theme for tkinter
+import logging
 
 from setup_page import SetupPage
 from sensor_page import SensorPage
 from session_page import SessionPage
 import sensor_utils  # Import the sensor utilities module
+
+logger = logging.getLogger(__name__)
 
 class IISCAApp(tk.Tk):
     def __init__(self):
@@ -48,6 +50,7 @@ class IISCAApp(tk.Tk):
         self.running = False
         self.paused = False
         self.data_thread = None
+        self.ml_thread = None
         
         # Create container for frames
         self.container = tk.Frame(self)
@@ -120,6 +123,8 @@ class IISCAApp(tk.Tk):
         
         self.data_dir = f"data_{participant_id}_{timestamp}"
         os.makedirs(self.data_dir, exist_ok=True)
+        # Also make `data_dir` available to ML for correct output path
+        self.participant_data["data_dir"] = self.data_dir
         
         # Save participant data
         with open(os.path.join(self.data_dir, "participant_info.json"), "w") as f:
@@ -130,13 +135,37 @@ class IISCAApp(tk.Tk):
         self.data_thread.daemon = True
         self.data_thread.start()
         
+        # Start ML prediction thread (1 Hz)
+        self.ml_thread = threading.Thread(target=self.run_ml_loop)
+        self.ml_thread.daemon = True
+        self.ml_thread.start()
+        
         # Update status
         self.status_bar.config(text="Data collection started")
+        
+        # Initialize session data file immediately (atomic write)
+        self.save_session_data()
     
+    def save_session_data(self):
+        """Atomically write session data to disk immediately.
+        Uses a temporary file and os.replace to avoid partial writes.
+        """
+        try:
+            if not hasattr(self, "data_dir") or not self.data_dir:
+                return
+            os.makedirs(self.data_dir, exist_ok=True)
+            path = os.path.join(self.data_dir, "session_data.json")
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(self.session_data, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception as e:
+            logger.exception("Error saving session data")
+
     def collect_data(self):
         """Collect data from sensors in a separate thread"""
-        last_ml_run_time = 0
-        
         while self.running:
             if not self.paused:
                 # Collect data from all sensors using the sensor_utils module
@@ -146,26 +175,42 @@ class IISCAApp(tk.Tk):
                 while not self.data_queue.empty():
                     data_item = self.data_queue.get()
                     sensor_utils.process_sensor_data(data_item, self.data_dir, self.current_session, self.session_types)
-                
-                # Run ML prediction every n seconds for non-Standard sessions
-                current_time = time.time()
-                if (current_time - last_ml_run_time >= 1 and
-                    self.current_session < len(self.session_types)):
-                    
-                    # Generate prediction and get sample counts using the sensor_utils module
-                    prediction_value, sample_counts = sensor_utils.run_ml_prediction(self.participant_data)
-                    
-                    if (hasattr(self.frames[SessionPage], "ml_prediction_active") and
-                    self.frames[SessionPage].ml_prediction_active and
-                    self.session_types[self.current_session] != "Standard"):
-                        # Update the ML prediction display in the session page
-                        self.frames[SessionPage].update_ml_display(prediction_value, sample_counts)
-                    
-                    # Update the last run time
-                    last_ml_run_time = current_time
             
             # Sleep to control data collection rate
-            time.sleep(0.001)
+            time.sleep(0.01)
+    
+    def run_ml_loop(self):
+        """Dedicated ML prediction loop running at ~1 Hz"""
+        next_tick = time.time()
+        while self.running:
+            # Align to 1 Hz
+            next_tick += 1.0
+            
+            try:
+                if (not self.paused and
+                    self.current_session < len(self.session_types)):
+                    
+                    # Generate prediction and get distances + sample counts using the sensor_utils module
+                    current_session_type = None
+                    try:
+                        if self.current_session < len(self.session_types):
+                            current_session_type = self.session_types[self.current_session]
+                    except Exception:
+                        current_session_type = None
+                    prediction_value, closest_prototype, distances, sample_counts = sensor_utils.run_ml_prediction(self.participant_data, session_type=current_session_type)
+                    
+                    # Update UI when active and not Standard session
+                    if (hasattr(self.frames[SessionPage], "ml_prediction_active") and
+                        self.frames[SessionPage].ml_prediction_active and
+                        self.session_types[self.current_session] != "Standard"):
+                        # Update the ML prediction display in the session page with prototype distances
+                        self.frames[SessionPage].update_ml_display(distances, sample_counts)
+            except Exception:
+                logger.exception("Error in ML loop")
+            
+            # Sleep until next tick
+            sleep_for = max(0.0, next_tick - time.time())
+            time.sleep(sleep_for)
     
     def pause_data_collection(self):
         """Pause or resume data collection"""
@@ -184,10 +229,11 @@ class IISCAApp(tk.Tk):
         
         if self.data_thread and self.data_thread.is_alive():
             self.data_thread.join(timeout=1.0)
+        if self.ml_thread and self.ml_thread.is_alive():
+            self.ml_thread.join(timeout=1.0)
         
-        # Save session data
-        with open(os.path.join(self.data_dir, "session_data.json"), "w") as f:
-            json.dump(self.session_data, f, indent=4)
+        # Save session data immediately using atomic write
+        self.save_session_data()
         
         self.status_bar.config(text="Data collection stopped")
     
@@ -199,5 +245,11 @@ class IISCAApp(tk.Tk):
             self.destroy()
 
 if __name__ == "__main__":
+    # Basic structured logging configuration
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
     app = IISCAApp()
     app.mainloop()

@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import random
 from sensor_page import SensorPage
+import os
 
 class SetupPage(tk.Frame):
     def __init__(self, parent, controller):
@@ -42,25 +43,41 @@ class SetupPage(tk.Frame):
         self.location.insert(0, "Nashville")
         self.location.grid(row=2, column=1, sticky="w", pady=8, padx=5)
         
-        # ML Threshold with tooltip
-        ttk.Label(inner_frame, text="ML Threshold:", font=("Helvetica", 11)).grid(row=3, column=0, sticky="w", pady=8)
-        threshold_frame = ttk.Frame(inner_frame)
-        threshold_frame.grid(row=3, column=1, sticky="w", pady=8, padx=5)
-        
-        self.ml_threshold = ttk.Entry(threshold_frame, width=30, font=("Helvetica", 11))
-        self.ml_threshold.insert(0, "0.95")
-        self.ml_threshold.pack(side="left")
-        
-        threshold_info = ttk.Label(threshold_frame, text="ⓘ", font=("Helvetica", 11))
-        threshold_info.pack(side="left", padx=5)
-        threshold_info.bind("<Enter>", lambda e: self.show_tooltip("Value between 0 and 1 for ML prediction threshold"))
-        threshold_info.bind("<Leave>", lambda e: self.hide_tooltip())
-        
         # Number of Sessions with input box
-        ttk.Label(inner_frame, text="Number of Sessions:", font=("Helvetica", 11)).grid(row=4, column=0, sticky="w", pady=8)
+        ttk.Label(inner_frame, text="Number of Sessions:", font=("Helvetica", 11)).grid(row=3, column=0, sticky="w", pady=8)
         self.sessions_var = ttk.Entry(inner_frame, width=30, font=("Helvetica", 11))
         self.sessions_var.insert(0, "10")  # Default value
-        self.sessions_var.grid(row=4, column=1, sticky="w", pady=8, padx=5)
+        self.sessions_var.grid(row=3, column=1, sticky="w", pady=8, padx=5)
+        
+        # ML Window Size (seconds)
+        ttk.Label(inner_frame, text="Window Size (s):", font=("Helvetica", 11)).grid(row=4, column=0, sticky="w", pady=8)
+        self.window_size_var = ttk.Entry(inner_frame, width=30, font=("Helvetica", 11))
+        self.window_size_var.insert(0, "30")
+        self.window_size_var.grid(row=4, column=1, sticky="w", pady=8, padx=5)
+        
+        # Removed "Seconds in Advance" input
+        # Model Selection (participant/group)
+        ttk.Label(inner_frame, text="Model Folder:", font=("Helvetica", 11)).grid(row=5, column=0, sticky="w", pady=8)
+        self.model_var = tk.StringVar()
+        self.model_combo = ttk.Combobox(inner_frame, width=30, textvariable=self.model_var, state="readonly")
+        # Discover available model folders inside 'models'
+        model_options = []
+        try:
+            base_dir = "models"
+            if os.path.isdir(base_dir):
+                for name in sorted(os.listdir(base_dir)):
+                    path = os.path.join(base_dir, name)
+                    # Only include directories that look like model folders (contain model.pt)
+                    if os.path.isdir(path) and os.path.exists(os.path.join(path, "model.pt")) and name.lower() != "group":
+                        model_options.append(name)
+        except Exception:
+            model_options = []
+        self.model_combo["values"] = model_options
+        # Default to first participant option (exclude 'group')
+        default_choice = model_options[0] if model_options else ""
+        if default_choice:
+            self.model_var.set(default_choice)
+        self.model_combo.grid(row=5, column=1, sticky="w", pady=5, padx=0)
         
         # Next button with improved styling
         button_frame = ttk.Frame(self)
@@ -72,20 +89,7 @@ class SetupPage(tk.Frame):
     def update_sessions_label(self, event=None):
         self.sessions_label.config(text=str(self.sessions_var.get()))
     
-    def show_tooltip(self, text):
-        x, y, _, _ = self.winfo_toplevel().winfo_geometry().split('+')
-        x, y = int(x), int(y)
-        
-        self.tooltip = tk.Toplevel(self)
-        self.tooltip.wm_overrideredirect(True)
-        self.tooltip.wm_geometry(f"+{x+100}+{y+300}")
-        
-        label = ttk.Label(self.tooltip, text=text, background="#FFFFCC", relief="solid", borderwidth=1)
-        label.pack()
-    
-    def hide_tooltip(self):
-        if hasattr(self, "tooltip"):
-            self.tooltip.destroy()
+    # Removed tooltip helpers since ML threshold is no longer used
     
     def save_and_continue(self):
         # Validate inputs
@@ -93,15 +97,6 @@ class SetupPage(tk.Frame):
             messagebox.showerror("Error", "Please enter a Participant ID")
             return
             
-        try:
-            ml_threshold = float(self.ml_threshold.get())
-            if not 0 <= ml_threshold <= 1:
-                messagebox.showerror("Error", "ML Threshold must be between 0 and 1")
-                return
-        except ValueError:
-            messagebox.showerror("Error", "ML Threshold must be a number between 0 and 1")
-            return
-        
         # Validate number of sessions
         try:
             num_sessions = int(self.sessions_var.get())
@@ -112,14 +107,43 @@ class SetupPage(tk.Frame):
             messagebox.showerror("Error", "Number of Sessions must be a valid integer")
             return
         
+        # Validate window size seconds
+        try:
+            window_seconds = int(float(self.window_size_var.get()))
+            if window_seconds <= 0:
+                messagebox.showerror("Error", "Window Size must be greater than 0 seconds")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "Window Size must be a valid number")
+            return
+        
+        # Removed "Seconds in Advance" validation
+        
         # Save participant data
         self.controller.participant_data = {
             "participant_id": self.participant_id.get(),
             "age": self.age.get(),
             "location": self.location.get(),
-            "ml_threshold": self.ml_threshold.get(),
-            "num_sessions": str(self.sessions_var.get())
+            "num_sessions": str(self.sessions_var.get()),
+            "ml_window_seconds": str(window_seconds),
+            # Removed "ml_seconds_in_advance"
+            "model_participant": self.model_var.get() if hasattr(self, "model_var") else "",
         }
+        
+        # Validate selected model folder exists; do not fall back to 'group'
+        try:
+            base_dir = "models"
+            chosen = self.controller.participant_data.get("model_participant", "")
+            chosen_path = os.path.join(base_dir, chosen) if chosen else ""
+            if not chosen:
+                messagebox.showerror("Error", "Please select a participant model (excluding 'group').")
+                return
+            if not (os.path.isdir(chosen_path) and os.path.exists(os.path.join(chosen_path, "model.pt"))):
+                messagebox.showerror("Error", "Selected participant model folder is invalid or missing 'model.pt'.")
+                return
+        except Exception:
+            messagebox.showerror("Error", "Failed to validate models folder.")
+            return
         
         # Generate random session types
         try:

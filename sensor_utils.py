@@ -58,6 +58,7 @@ file_batch_stop_event = threading.Event()
 
 # Machine learning model
 model_loader = None
+node_mapping_cache = {}  # Cache BLE index -> expected model node name mapping
 
 # Register cleanup function to run at exit
 atexit.register(lambda: cleanup_sensor_system())
@@ -722,6 +723,7 @@ class DeepPrototypeModelLoader:
             map_location=self.device
         ))
         self.model.eval()
+        self.last_distances = None  # store last distances for UI
         
         # Load prototypes
         prototypes_path = os.path.join(model_dir, "prototypes.pkl")
@@ -730,13 +732,30 @@ class DeepPrototypeModelLoader:
         with open(prototypes_path, "rb") as f:
             prototype_dict = pickle.load(f)
             # Convert numpy arrays back to torch tensors
-            self.prototypes = {k: torch.tensor(v, device=self.device) for k, v in prototype_dict.items()}
+            self.prototypes = {k: torch.tensor(v, device=self.device, dtype=torch.float32) for k, v in prototype_dict.items()}
         
-        # Create a mapping for prototype labels
+        # Normalize prototype keys and determine negative key
+        # Support either 'Negative' or 0 as the negative prototype key
+        possible_negative_keys = ['Negative', 0, '0']
+        self.negative_key = None
+        for k in possible_negative_keys:
+            if k in self.prototypes:
+                self.negative_key = k
+                break
+        if self.negative_key is None:
+            # Fallback: if only two prototypes, assume the first key sorted is negative
+            # But warn clearly
+            print("Warning: Could not find explicit negative prototype key; defaulting to first key.")
+            self.negative_key = list(self.prototypes.keys())[0]
+        
+        # Build ordered labels list: negative first, then all positives
         self.prototype_labels = ['Negative']
+        self.positive_labels = []
         for key in self.prototypes.keys():
-            if key != 0:  # 0 is the negative prototype
-                self.prototype_labels.append(str(key))
+            if key != self.negative_key:
+                self.positive_labels.append(str(key))
+        # Preserve stable ordering of positives
+        self.positive_labels.sort()
     
     def preprocess_features(self, features_df: pd.DataFrame) -> np.ndarray:
         """
@@ -795,72 +814,138 @@ class DeepPrototypeModelLoader:
         with torch.no_grad():
             embeddings = self.model(X_tensor)
         
-        # Prepare prototype tensors for distance calculation
+        # Prepare prototype tensors for distance calculation using saved ordering
         all_prototype_tensors = []
-        prototype_labels = []
+        ordered_labels = []
         
-        # Add the negative prototype first
-        all_prototype_tensors.append(self.prototypes[0].unsqueeze(0))
-        prototype_labels.append('Negative')
+        # Negative first
+        all_prototype_tensors.append(self.prototypes[self.negative_key].unsqueeze(0))
+        ordered_labels.append('Negative')
         
-        # Add all positive prototypes
-        for category, proto in self.prototypes.items():
-            if category != 0:
-                all_prototype_tensors.append(proto.unsqueeze(0))
-                prototype_labels.append(str(category))
+        # Then all positives (sorted string labels)
+        for label in self.positive_labels:
+            # Find the original key that stringifies to this label
+            # Saved keys could be strings already; map robustly
+            proto_key = None
+            for k in self.prototypes.keys():
+                if k == self.negative_key:
+                    continue
+                if str(k) == label:
+                    proto_key = k
+                    break
+            if proto_key is None:
+                continue
+            all_prototype_tensors.append(self.prototypes[proto_key].unsqueeze(0))
+            ordered_labels.append(label)
+        
+        # Expose ordered labels for downstream consumers (e.g., logging/saving)
+        self.ordered_labels = ordered_labels
         
         # Stack all prototypes
         all_prototypes_stacked = torch.cat(all_prototype_tensors, dim=0)
         
         # Compute distances to all prototypes
         dists = torch.cdist(embeddings, all_prototypes_stacked, p=2) ** 2
+        # Apply model-behavior adjustment: subtract 4 from Negative prototype distance (index 0)
+        if dists.shape[1] > 0:
+            dists[:, 0] = dists[:, 0] - 15
         
-        # Apply softmax to get probabilities across all prototypes
+        # Log distances to each prototype for the first sample (useful in live 1-row inference)
+        try:
+            if dists.shape[0] > 0:
+                row0 = dists[0].detach().cpu().numpy()
+                dist_log = ", ".join(f"{label}:{float(row0[i]):.4f}" for i, label in enumerate(ordered_labels))
+                print(f"Prototype distances -> {dist_log}")
+                # Save for external access
+                self.last_distances = [(label, float(row0[i])) for i, label in enumerate(ordered_labels)]
+        except Exception as _:
+            pass
+        
+        # Softmax over negative and all positive prototypes
         probs = nn.functional.softmax(-dists, dim=1)
         
-        # Sum probabilities of all positive prototypes (all except 'Negative' which is at index 0)
-        prob_positive = 1 - probs[:, 0].cpu().numpy()
-        
-        # Apply Gaussian smoothing if requested
+        # Probability of being positive = 1 - P(negative)
+        prob_positive = (1.0 - probs[:, 0]).cpu().numpy()
         if smoothing_sigma > 0:
             prob_positive = gaussian_filter1d(prob_positive, sigma=smoothing_sigma)
         
-        # Get the most likely prototype for each embedding
-        most_likely_prototype_idx = torch.argmin(dists, dim=1).cpu().numpy()
-        most_likely_prototype = [prototype_labels[idx] for idx in most_likely_prototype_idx]
+        # Closest overall prototype (may be 'Negative')
+        closest_overall_idx = torch.argmin(dists, dim=1).cpu().numpy()
+        most_likely_prototype = [ordered_labels[idx] for idx in closest_overall_idx]
         
-        # Get the most likely POSITIVE prototype (ignoring the negative prototype)
-        # First, create a version of distances with the negative prototype set to infinity
-        positive_only_dists = dists.clone()
-        positive_only_dists[:, 0] = float('inf')  # Set distance to negative prototype to infinity
+        # Closest positive-only prototype
+        positive_only_dists = dists[:, 1:]  # exclude negative at index 0
+        if positive_only_dists.shape[1] > 0:
+            closest_positive_rel_idx = torch.argmin(positive_only_dists, dim=1).cpu().numpy()
+            closest_positive_idx = (closest_positive_rel_idx + 1)  # shift because we excluded negative
+            closest_positive = [ordered_labels[idx] for idx in closest_positive_idx]
+            # Probability of the closest positive prototype
+            closest_positive_prob = probs.gather(
+                1, torch.tensor(closest_positive_idx, device=self.device).unsqueeze(1)
+            ).squeeze().detach().cpu().numpy()
+        else:
+            closest_positive = ['Negative'] * len(embeddings)
+            closest_positive_prob = np.zeros(len(embeddings))
         
-        # Now find the most likely positive prototype
-        most_likely_positive_idx = torch.argmin(positive_only_dists, dim=1).cpu().numpy()
-        most_likely_positive = [prototype_labels[idx] for idx in most_likely_positive_idx]
-        
-        # Get the probability of the most likely positive prototype
-        most_likely_positive_prob = probs.gather(1, torch.tensor(most_likely_positive_idx, device=self.device).unsqueeze(1)).squeeze().cpu().numpy()
+        # Binary decision reflective of original training:
+        # Positive iff any positive prototype is closer than the negative prototype
+        negative_dists = dists[:, 0]
+        min_positive_dists, _ = torch.min(dists[:, 1:], dim=1) if dists.shape[1] > 1 else (torch.full((dists.shape[0],), float('inf'), device=dists.device), None)
+        is_positive = (min_positive_dists < negative_dists).int().cpu().numpy()
         
         # Create predictions DataFrame
         predictions = pd.DataFrame({
             "timestamp": timestamps,
             "prob_positive": prob_positive,
             "most_likely_prototype": most_likely_prototype,
-            "most_likely_positive": most_likely_positive,
-            "most_likely_positive_prob": most_likely_positive_prob,
-            "is_positive": (most_likely_prototype_idx != 0).astype(int)
+            "most_likely_positive": closest_positive,
+            "most_likely_positive_prob": closest_positive_prob,
+            "is_positive": is_positive
         })
         
         return predictions
 
-def run_ml_prediction(participant_data):
+def run_ml_prediction(participant_data, session_type=None):
     """Run machine learning prediction on sensor data"""
 
     global model_loader
-    if model_loader is None:
-        models_base_dir = "models"
-        available_models = os.listdir(models_base_dir)
-        model_loader = DeepPrototypeModelLoader(model_dir="models/")
+    models_base_dir = "models"
+    # Choose desired model directory based on session type and participant selection
+    selected_folder = None
+    try:
+        if session_type == "Group":
+            selected_folder = "group"
+        elif participant_data:
+            selected_folder = participant_data.get("model_participant", None)
+    except Exception:
+        selected_folder = None
+    desired_dir = None
+    try:
+        # Validate selected folder
+        if selected_folder:
+            candidate = os.path.join(models_base_dir, selected_folder)
+            if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "model.pt")):
+                desired_dir = candidate
+        # Prefer 'group' fallback
+        if desired_dir is None:
+            group_dir = os.path.join(models_base_dir, "group")
+            if os.path.isdir(group_dir) and os.path.exists(os.path.join(group_dir, "model.pt")):
+                desired_dir = group_dir
+        # First valid model under models/
+        if desired_dir is None and os.path.isdir(models_base_dir):
+            for name in sorted(os.listdir(models_base_dir)):
+                path = os.path.join(models_base_dir, name)
+                if os.path.isdir(path) and os.path.exists(os.path.join(path, "model.pt")):
+                    desired_dir = path
+                    break
+    except Exception:
+        desired_dir = None
+    if desired_dir is None:
+        # Clear error path (will raise inside loader)
+        desired_dir = models_base_dir
+    # Load or reload model if needed
+    if model_loader is None or getattr(model_loader, "model_dir", None) != desired_dir:
+        model_loader = DeepPrototypeModelLoader(model_dir=desired_dir)
 
     # Get the last 5 seconds of sensor data
     recent_data, sample_counts = get_samples()
@@ -880,8 +965,63 @@ def run_ml_prediction(participant_data):
     for feature in model_loader.feature_names:
         feature_dict[feature] = [0.0]
     
+    # Build expected node names from model feature names and create a stable mapping
+    expected_nodes = []
+    try:
+        import re as _re
+        seen = set()
+        for fname in model_loader.feature_names:
+            m = _re.search(r"^Wing_(.+?)_0000_", fname)
+            if m:
+                node = m.group(1)
+                if node not in seen:
+                    expected_nodes.append(node)
+                    seen.add(node)
+    except Exception:
+        expected_nodes = []
+    # Create mapping from BLE device idx to expected node name (stable across calls)
+    global node_mapping_cache
+    mapping_changed = False
+    for device in ble_devices:
+        if device.idx not in node_mapping_cache:
+            mapped = None
+            # Prefer 1:1 by index when possible
+            if 0 <= device.idx < len(expected_nodes):
+                mapped = expected_nodes[device.idx]
+            else:
+                # Fallback: if the device name already appears in expected nodes, use it
+                if device.name in expected_nodes:
+                    mapped = device.name
+                elif expected_nodes:
+                    # Last resort: first unused expected node
+                    for cand in expected_nodes:
+                        if cand not in node_mapping_cache.values():
+                            mapped = cand
+                            break
+                    if mapped is None:
+                        mapped = expected_nodes[0]
+                else:
+                    mapped = device.name
+            node_mapping_cache[device.idx] = mapped
+            mapping_changed = True
+    if mapping_changed:
+        try:
+            print("BLE->Model node mapping:", {d.idx: node_mapping_cache.get(d.idx) for d in ble_devices})
+        except Exception:
+            pass
+
     # Calculate statistics for each IMU sensor and map to feature dict
     if sample_counts["imu_samples"] > 0:
+        # Determine time windows in seconds based on participant config
+        try:
+            window_seconds = int(float(participant_data.get("ml_window_seconds", 30)))
+        except Exception:
+            window_seconds = 30
+        current_ts = time.time()
+        window_start = current_ts - window_seconds
+        prev_window_start = current_ts - 2 * window_seconds
+        context_start = current_ts - 3 * window_seconds
+
         for sensor_id, sensor_data in recent_data["imu_sensors"].items():
             # Extract the node name from the sensor ID
             device_idx = sensor_id.split("_")[-1]
@@ -889,69 +1029,71 @@ def run_ml_prediction(participant_data):
             if device_idx.isdigit():
                 for device in ble_devices:
                     if device.idx == int(device_idx) - 1:  # Convert from 1-based to 0-based indexing
-                        node_name = device.name
+                        # Map to expected model node name
+                        node_name = node_mapping_cache.get(device.idx, device.name)
                         break
             
             if node_name is None:
                 print(f"Could not find device name for {sensor_id}, skipping")
                 continue  # Skip if we can't find the device name
             
-            # Get quaternion values (qw, qx, qy, qz are at indices 0, 1, 2, 3 in the data format)
-            quat_data = np.array([data_point[:4] for data_point in sensor_data["data"]])
+            # Get timestamps and quaternion values (qw, qx, qy, qz are at indices 0..3)
+            ts = np.array(sensor_data["timestamps"], dtype=float)
+            if len(ts) == 0:
+                continue
+            quat_data = np.array([data_point[:4] for data_point in sensor_data["data"]], dtype=float)
+            if quat_data.shape[0] != ts.shape[0]:
+                # Align lengths if needed
+                min_len = min(len(ts), len(quat_data))
+                ts = ts[-min_len:]
+                quat_data = quat_data[-min_len:, :]
             
-            # Only calculate if we have enough data points
-            if len(quat_data) > 0:
-                component_names = ["qw", "qx", "qy", "qz"]
+            component_names = ["qw", "qx", "qy", "qz"]
+            for i, comp_name in enumerate(component_names):
+                values = quat_data[:, i]
+                if values.size < 1:
+                    continue
                 
-                # Calculate statistics for each quaternion component
-                for i, comp_name in enumerate(component_names):
-                    values = quat_data[:, i]
-                    
-                    # Skip if not enough values
-                    if len(values) < 2:
-                        continue
-                    
-                    # Map component name to expected format
-                    comp_mapped = component_mapping[comp_name]
-                    
-                    # Basic statistics
-                    mean_val = float(np.mean(values))
-                    min_val = float(np.min(values))
-                    max_val = float(np.max(values))
-                    std_val = float(np.std(values))
-                    
-                    # Calculate rolling statistics (window of 3 samples or 1/3 of data points, whichever is larger)
-                    window_size = max(3, len(values) // 3)
-                    if len(values) >= window_size:
-                        rolling_mean = np.mean(values[-window_size:])
-                        rolling_std = np.std(values[-window_size:])
-                    else:
-                        rolling_mean = mean_val
-                        rolling_std = std_val
-                    
-                    # Calculate trend (slope of linear regression)
-                    x = np.arange(len(values))
-                    A = np.vstack([x, np.ones(len(x))]).T
-                    slope, _ = np.linalg.lstsq(A, values, rcond=None)[0]
-                    trend = float(slope)
-                    
-                    # Construct feature names
-                    feature_prefix = f"Wing_{node_name}_0000_{comp_mapped}"
-                    
-                    # Store values in feature_dict (just one value per feature)
-                    for stat, value in [
-                        ("mean", mean_val),
-                        ("min", min_val),
-                        ("max", max_val),
-                        ("std", std_val),
-                        ("rolling_mean", rolling_mean),
-                        ("rolling_std", rolling_std),
-                        ("trend", trend)
-                    ]:
-                        feature_name = f"{feature_prefix}_{stat}"
-                        if feature_name in feature_dict:
-                            # Set single value
-                            feature_dict[feature_name] = [value]
+                # Masks for time windows
+                mask_window = (ts >= window_start) & (ts <= current_ts)
+                mask_prev = (ts >= prev_window_start) & (ts < window_start)
+                mask_context = (ts >= context_start) & (ts <= current_ts)
+                
+                # Handle empty windows gracefully
+                vals_window = values[mask_window] if mask_window.any() else values[-min(5, len(values)):]
+                vals_prev = values[mask_prev] if mask_prev.any() else np.array([])
+                vals_context = values[mask_context] if mask_context.any() else vals_window
+                
+                # Basic stats on current window
+                mean_val = float(np.mean(vals_window)) if vals_window.size else 0.0
+                min_val = float(np.min(vals_window)) if vals_window.size else 0.0
+                max_val = float(np.max(vals_window)) if vals_window.size else 0.0
+                std_val = float(np.std(vals_window)) if vals_window.size else 0.0
+                
+                # Rolling stats over 3×window context
+                rolling_mean = float(np.mean(vals_context)) if vals_context.size else mean_val
+                rolling_std = float(np.std(vals_context)) if vals_context.size else std_val
+                
+                # Trend = mean(current window) - mean(previous window)
+                prev_mean = float(np.mean(vals_prev)) if vals_prev.size else None
+                trend = float(mean_val - prev_mean) if prev_mean is not None else 0.0
+                
+                # Map component name to expected format
+                comp_mapped = component_mapping[comp_name]
+                feature_prefix = f"Wing_{node_name}_0000_{comp_mapped}"
+                
+                for stat, value in [
+                    ("mean", mean_val),
+                    ("min", min_val),
+                    ("max", max_val),
+                    ("std", std_val),
+                    ("rolling_mean", rolling_mean),
+                    ("rolling_std", rolling_std),
+                    ("trend", trend)
+                ]:
+                    feature_name = f"{feature_prefix}_{stat}"
+                    if feature_name in feature_dict:
+                        feature_dict[feature_name] = [value]
     
     # Create DataFrame with features
     example_features = pd.DataFrame(feature_dict)
@@ -986,22 +1128,38 @@ def run_ml_prediction(participant_data):
     filename = "ML_Predictions.csv"
     file_key = (data_dir, filename)
     
-    # Prepare prediction data for writing
-    prediction_data = {
-        "timestamp": current_time,
-        "prob_positive": predictions['prob_positive'].values[0]
-    }
+    # Prepare prediction distances for writing
+    distances = {}
+    labels_order = []
+    if hasattr(model_loader, "last_distances") and model_loader.last_distances:
+        distances = {label: dist for (label, dist) in model_loader.last_distances}
+    if hasattr(model_loader, "ordered_labels"):
+        labels_order = model_loader.ordered_labels
+    else:
+        labels_order = list(distances.keys())
     
-    # Format as CSV line
-    formatted_timestamp = f"{prediction_data['timestamp']:.3f}"
-    line = f"{formatted_timestamp},{prediction_data['prob_positive']:.4f}\n"
+    # Build header dynamically: timestamp + one column per prototype label
+    header = "timestamp"
+    if labels_order:
+        header += "," + ",".join(labels_order)
+    
+    # Build CSV line with timestamp and distances in the same order
+    formatted_timestamp = f"{current_time:.3f}"
+    values = []
+    for lbl in labels_order:
+        val = distances.get(lbl, float("nan"))
+        try:
+            values.append(f"{float(val):.4f}")
+        except Exception:
+            values.append("")
+    line = formatted_timestamp + (("," + ",".join(values)) if values else "") + "\n"
     
     with file_batch_lock:
         # Initialize batch if it doesn't exist
         if file_key not in file_write_batches:
             file_write_batches[file_key] = {
                 "data": [],
-                "header": "timestamp,prob_positive",
+                "header": header,
                 "last_update": time.time()
             }
         
@@ -1014,7 +1172,16 @@ def run_ml_prediction(participant_data):
             write_batch_to_file(file_key)
     
     # Return both the prediction and sample counts
-    return predictions['prob_positive'].values[0], sample_counts
+    # Determine closest positive category to return alongside probability
+    pred_prob = float(predictions['prob_positive'].values[0])
+    closest_positive = predictions['most_likely_positive'].values[0]
+    # If model believes it's negative, report 'Negative' as closest
+    closest_report = closest_positive if predictions['is_positive'].values[0] == 1 else 'Negative'
+    # Package distances to prototypes if available
+    distances = {}
+    if hasattr(model_loader, "last_distances") and model_loader.last_distances:
+        distances = {label: dist for (label, dist) in model_loader.last_distances}
+    return pred_prob, closest_report, distances, sample_counts
 
 # BLE connection utilities from test.py
 async def connect_ble_sensors():
